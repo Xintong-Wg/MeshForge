@@ -1,0 +1,1257 @@
+#include "App/Application.h"
+#include "Core/Logger.h"
+#include "Core/TaskSystem.h"
+#include "Mesh/Simplifier.h"
+
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/gl.h>
+#include <SDL2/SDL.h>
+#include <imgui_impl_sdl2.h>
+#include <imgui_impl_opengl3.h>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+#include <filesystem>
+#include <cctype>
+#include <cstdlib>
+#include <algorithm>
+
+namespace mf {
+
+Application::Application() = default;
+Application::~Application() = default;
+
+bool Application::init(uint32_t width, uint32_t height, const char* title) {
+    MF_INFO("MeshForge v0.1.0 initializing...");
+
+    // Init SDL2
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+        MF_ERROR("SDL_Init failed: {}", SDL_GetError());
+        return false;
+    }
+
+    // Compute window size from display bounds (90% width, 88% height, centered)
+    SDL_Rect display;
+    int winW = static_cast<int>(width);
+    int winH = static_cast<int>(height);
+    int winX = SDL_WINDOWPOS_CENTERED;
+    int winY = SDL_WINDOWPOS_CENTERED;
+    if (SDL_GetDisplayBounds(0, &display) == 0) {
+        winW = static_cast<int>(display.w * 0.90f);
+        winH = static_cast<int>(display.h * 0.88f);
+        winX = display.x + (display.w - winW) / 2;
+        winY = display.y + (display.h - winH) / 2;
+    }
+    m_width = static_cast<uint32_t>(winW);
+    m_height = static_cast<uint32_t>(winH);
+
+    // OpenGL attributes
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+
+    m_window = SDL_CreateWindow(title,
+                                 winX, winY,
+                                 winW, winH,
+                                 SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!m_window) {
+        MF_ERROR("SDL_CreateWindow failed: {}", SDL_GetError());
+        SDL_Quit();
+        return false;
+    }
+
+    m_glContext = SDL_GL_CreateContext(m_window);
+    if (!m_glContext) {
+        MF_ERROR("SDL_GL_CreateContext failed: {}", SDL_GetError());
+        SDL_DestroyWindow(m_window);
+        SDL_Quit();
+        return false;
+    }
+
+    SDL_GL_MakeCurrent(m_window, m_glContext);
+    SDL_GL_SetSwapInterval(1); // vsync
+
+    m_meshCache = std::make_shared<MeshCache>(m_config.cacheDir);
+
+    if (!m_ui.init(m_window, m_glContext)) {
+        MF_ERROR("UI init failed");
+        return false;
+    }
+
+    m_scene = std::make_shared<Scene>();
+    m_ui.setScene(m_scene);
+
+    // Viewport -> SceneTree selection callback
+    m_ui.setViewportSelectionCallback([this](const std::vector<EntityId>& ids) {
+        m_ui.selectNodesById(ids);
+    });
+
+    // Right-click context menu callbacks
+    ActionCallbacks actCb;
+    actCb.onDeleteSelected = [this]() { deleteSelected(m_ui.selectedNodes()); };
+    actCb.onExportSelectedglTF = [this]() {
+        auto sel = m_ui.selectedNodes();
+        if (sel.empty()) return;
+        std::string path = m_ui.saveFileDialog(false);
+        if (!path.empty()) {
+            glTFExporter exporter;
+            std::vector<SceneNode*> nodes;
+            for (auto& n : sel) nodes.push_back(n.get());
+            exporter.exportNodes(nodes, path, m_config.exportOpt);
+        }
+    };
+    actCb.onExportSelectedSTL = [this]() {
+        auto sel = m_ui.selectedNodes();
+        if (sel.empty()) return;
+        std::string path = m_ui.saveFileDialog(true);
+        if (!path.empty()) {
+            STLExporter exporter;
+            std::vector<SceneNode*> nodes;
+            for (auto& n : sel) nodes.push_back(n.get());
+            exporter.exportNodes(nodes, path);
+        }
+    };
+    actCb.onGroupSelected = [this]() { groupSelected(m_ui.selectedNodes()); };
+    actCb.onFocusOnSelection = [this]() {
+        auto sel = m_ui.selectedNodes();
+        if (!sel.empty()) {
+            const auto aabb = sel[0]->worldAABB();
+            if (!aabb.isEmpty()) {
+                rebuildViewportMesh();
+                m_ui.setMeshForViewport(&m_viewportMesh);
+            }
+        }
+    };
+    m_ui.setActionCallbacks(actCb);
+
+    m_camera.aspect = static_cast<float>(width) / static_cast<float>(height);
+
+    m_running = true;
+    m_lastFrameTime = static_cast<float>(SDL_GetTicks()) / 1000.0f;
+
+    MF_INFO("Application initialized (SDL2 + OpenGL)");
+    return true;
+}
+
+void Application::shutdown() {
+    m_ui.shutdown();
+
+    if (m_glContext) {
+        SDL_GL_DeleteContext(m_glContext);
+        m_glContext = nullptr;
+    }
+    if (m_window) {
+        SDL_DestroyWindow(m_window);
+        m_window = nullptr;
+    }
+    SDL_Quit();
+    MF_INFO("Application shutdown");
+}
+
+bool Application::isRunning() const {
+    return m_running;
+}
+
+void Application::processEvents() {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        ImGui_ImplSDL2_ProcessEvent(&event);
+        if (event.type == SDL_QUIT) {
+            m_running = false;
+        }
+        if (event.type == SDL_WINDOWEVENT &&
+            event.window.event == SDL_WINDOWEVENT_CLOSE &&
+            event.window.windowID == SDL_GetWindowID(m_window)) {
+            m_running = false;
+        }
+    }
+}
+
+void Application::runFrame() {
+    processEvents();
+
+    float now = static_cast<float>(SDL_GetTicks()) / 1000.0f;
+    float dt = now - m_lastFrameTime;
+    m_lastFrameTime = now;
+
+    // Handle window resize
+    int w, h;
+    SDL_GetWindowSize(m_window, &w, &h);
+    if (w > 0 && h > 0) { m_width = uint32_t(w); m_height = uint32_t(h); }
+
+    // Clear
+    glViewport(0, 0, w, h);
+    glClearColor(0.15f, 0.15f, 0.15f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // UI — begin frame
+    m_ui.beginFrame();
+    MenuAction action = m_ui.showMainMenu();
+
+    // Rebuild viewport mesh BEFORE endFrame so the viewport sees the new mesh this frame
+    if (m_viewportMeshDirty) {
+        m_viewportMeshDirty = false;
+        rebuildViewportMesh();
+        m_ui.setMeshForViewport(&m_viewportMesh);
+    }
+
+    m_ui.endFrame();
+
+    // Handle menu actions
+    switch (action) {
+    case MenuAction::OpenSTEP: {
+        std::string path = m_ui.openFileDialog();
+        if (!path.empty()) loadSTEP(path);
+        break;
+    }
+    case MenuAction::ExportglTF: {
+        if (m_scene) {
+            std::string path = m_ui.saveFileDialog(false);
+            if (!path.empty()) exportglTF(path);
+        }
+        break;
+    }
+    case MenuAction::ExportSelectedglTF: {
+        auto selected = m_ui.selectedNodes();
+        if (!selected.empty()) {
+            std::string path = m_ui.saveFileDialog(false);
+            if (!path.empty()) {
+                glTFExporter exporter;
+                std::vector<SceneNode*> nodes;
+                for (auto& n : selected) nodes.push_back(n.get());
+                if (exporter.exportNodes(nodes, path, m_config.exportOpt)) {
+                    MF_INFO("Exported {} selected parts to {}", selected.size(), path);
+                }
+            }
+        }
+        break;
+    }
+    case MenuAction::ExportSelectedSTL: {
+        auto selected = m_ui.selectedNodes();
+        if (!selected.empty()) {
+            std::string path = m_ui.saveFileDialog(true);
+            if (!path.empty()) {
+                STLExporter exporter;
+                std::vector<SceneNode*> nodes;
+                for (auto& n : selected) nodes.push_back(n.get());
+                if (exporter.exportNodes(nodes, path)) {
+                    MF_INFO("Exported {} selected parts to STL {}", selected.size(), path);
+                }
+            }
+        }
+        break;
+    }
+    case MenuAction::BatchExportSelected: {
+        auto selected = m_ui.selectedNodes();
+        if (!selected.empty()) {
+            batchExportSelected(selected);
+        }
+        break;
+    }
+    case MenuAction::UndoSelected: {
+        auto selected = m_ui.selectedNodes();
+        if (!selected.empty()) {
+            undoSpecific(selected);
+        }
+        break;
+    }
+    case MenuAction::ResetSelected: {
+        auto selected = m_ui.selectedNodes();
+        if (!selected.empty()) {
+            resetToOriginal(selected);
+        }
+        break;
+    }
+    case MenuAction::DeleteSelected: {
+        auto selected = m_ui.selectedNodes();
+        if (!selected.empty()) {
+            deleteSelected(selected);
+        }
+        break;
+    }
+    case MenuAction::ExportSTL: {
+        if (m_scene) {
+            std::string path = m_ui.saveFileDialog(true);
+            if (!path.empty()) exportSTL(path);
+        }
+        break;
+    }
+    case MenuAction::Exit:
+        m_running = false;
+        break;
+    case MenuAction::TessellateAll:
+    case MenuAction::GenerateLOD:
+    case MenuAction::SimplifyAll:
+        processAll();
+        break;
+    default:
+        break;
+    }
+
+    // Update simplify settings with current selection
+    if (auto* ss = m_ui.simplifySettings()) {
+        ss->setTargetNodes(m_ui.selectedNodes());
+        if (ss->applyRequested()) {
+            ss->resetApplyFlag();
+            simplifySelected(m_ui.selectedNodes(), ss->params());
+        }
+    }
+
+    // Proxy Simplify panel
+    if (auto* ps = m_ui.proxySimplify()) {
+        ps->setTargetNodes(m_ui.selectedNodes());
+        if (ps->applyRequested()) {
+            ps->resetApplyFlag();
+            applyBoundingProxy(m_ui.selectedNodes(), ps->margin(), ps->geomType());
+        }
+    }
+
+    // Sync viewport highlight with scene tree selection
+    auto selectedNodes = m_ui.selectedNodes();
+    std::unordered_set<EntityId> currSelection;
+    for (auto& n : selectedNodes) currSelection.insert(n->id());
+    if (currSelection != m_prevSelection) {
+        m_prevSelection = currSelection;
+        // Compute union of index ranges for all selected nodes
+        uint32_t hOffset = 0, hCount = 0;
+        bool first = true;
+        for (auto& node : selectedNodes) {
+            if (!node->mesh()) continue;
+            std::string key = node->mesh()->name;
+            // Find the part ID that corresponds to this shape key
+            for (auto& [pid, part] : m_stepResult->partsById) {
+                if (part->shapeKey == key) {
+                    auto it = m_partIndexRanges.find(pid);
+                    if (it != m_partIndexRanges.end()) {
+                        if (first) {
+                            hOffset = it->second.first;
+                            hCount = it->second.second;
+                            first = false;
+                        } else {
+                            // Extend range (assumes contiguous layout)
+                            uint32_t end = std::max(hOffset + hCount, it->second.first + it->second.second);
+                            hOffset = std::min(hOffset, it->second.first);
+                            hCount = end - hOffset;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if (hCount > 0) {
+            m_ui.setHighlightForViewport(hOffset, hCount);
+        } else {
+            m_ui.clearViewportHighlight();
+        }
+    }
+
+    // Stats — show viewport mesh triangles and CAD-aware pipeline info
+    m_ui.setStats(m_viewportMesh.triangleCount(), 0,
+                   dt > 0.001f ? 1.0f / dt : 0.0f);
+    m_ui.setPipelineStats(
+        static_cast<int>(m_shapeAnalyses.size()),
+        static_cast<int>(m_classifications.size()),
+        static_cast<int>(m_taggedMeshes.size()),
+        static_cast<int>(m_shellResult.totalTrianglesBefore),
+        static_cast<int>(m_shellResult.totalTrianglesAfter),
+        m_config.useCADAwarePipeline);
+
+    SDL_GL_SwapWindow(m_window);
+}
+
+void Application::loadSTEP(const std::string& filepath) {
+    MF_INFO("Loading STEP: {}", filepath);
+    m_stepResult = m_stepReader.read(filepath);
+    if (m_stepResult && m_stepResult->root) {
+
+        // --- CAD-aware pipeline ---
+        if (m_config.useCADAwarePipeline) {
+            MF_INFO("Using CAD-aware pipeline...");
+
+            // Step 1: BRep Analysis
+            m_shapeAnalyses = m_brepAnalyzer.analyzeBatch(m_stepResult->shapesByKey);
+
+            // Step 2: Surface Classification
+            m_classifications = m_surfaceClassifier.classifyBatch(m_shapeAnalyses);
+
+            // Step 3: Adaptive Tessellation
+            m_taggedMeshes.clear();
+            m_partMeshes.clear();
+            m_partSimplifyStates.clear();
+
+            for (auto& [shapeKey, shape] : m_stepResult->shapesByKey) {
+                auto classIt = m_classifications.find(shapeKey);
+                if (classIt == m_classifications.end()) continue;
+
+                TaggedMesh taggedMesh = m_adaptiveTessellator.tessellate(
+                    shape, classIt->second, m_config.adaptiveTessellation);
+
+                if (!taggedMesh.mesh.vertices.empty()) {
+                    m_taggedMeshes[shapeKey] = taggedMesh;
+
+                    auto lodMesh = std::make_shared<LODMesh>();
+                    lodMesh->name = shapeKey;
+                    LODLevel level;
+                    level.level = 0;
+                    level.screenSize = 0.0f;
+                    level.mesh = taggedMesh.mesh;
+                    level.mesh.computeAABB();
+
+                    PartSimplifyState state;
+                    state.originalMesh = level.mesh;
+                    state.isSimplified = false;
+                    m_partSimplifyStates[shapeKey] = std::move(state);
+
+                    lodMesh->lods.push_back(std::move(level));
+                    m_partMeshes[shapeKey] = lodMesh;
+                }
+            }
+
+            // Step 4: Shell Extraction (Voxel Voting)
+            // Build world-space inputs for visibility analysis
+            std::vector<ShellShapeInput> shellInputs;
+            for (auto& [id, part] : m_stepResult->partsById) {
+                auto it = m_partMeshes.find(part->shapeKey);
+                if (it == m_partMeshes.end()) continue;
+
+                Mat4 world(1.0f);
+                auto p = part;
+                while (p && p->type != AssemblyNode::Type::Root) {
+                    world = p->localTransform * world;
+                    p = p->parent;
+                }
+
+                ShellShapeInput input;
+                input.shapeKey = id;
+                input.worldTransform = world;
+
+                // Transform mesh to world space
+                const auto& localMesh = it->second->lods[0].mesh;
+                input.mesh.vertices.reserve(localMesh.vertices.size());
+                for (const auto& v : localMesh.vertices) {
+                    Vertex wv = v;
+                    wv.position = Vec3(world * Vec4(v.position, 1.0f));
+                    wv.normal = glm::normalize(Vec3(world * Vec4(v.normal, 0.0f)));
+                    input.mesh.vertices.push_back(wv);
+                }
+                input.mesh.indices = localMesh.indices;
+
+                shellInputs.push_back(std::move(input));
+            }
+
+            m_shellResult = m_shellExtractor.extract(shellInputs, m_config.shellExtraction);
+
+            MF_INFO("CAD-aware pipeline complete: {} shapes analyzed, {} classified, {} extracted",
+                    m_shapeAnalyses.size(), m_classifications.size(), m_shellResult.totalTrianglesAfter);
+
+        } else {
+            // --- Legacy uniform tessellation ---
+            BRepEngine engine;
+            TessellationParams params = m_config.tessellation;
+            m_partMeshes.clear();
+            m_partSimplifyStates.clear();
+            for (auto& [shapeKey, shape] : m_stepResult->shapesByKey) {
+                BRepMesh brepMesh = engine.tessellate(shape, params);
+                if (!brepMesh.vertices.empty()) {
+                    auto lodMesh = std::make_shared<LODMesh>();
+                    lodMesh->name = shapeKey;
+                    LODLevel level;
+                    level.level = 0;
+                    level.screenSize = 0.0f;
+                    level.mesh.vertices = std::move(brepMesh.vertices);
+                    level.mesh.indices = std::move(brepMesh.indices);
+                    level.mesh.computeAABB();
+
+                    PartSimplifyState state;
+                    state.originalMesh = level.mesh;
+                    state.isSimplified = false;
+                    m_partSimplifyStates[shapeKey] = std::move(state);
+
+                    lodMesh->lods.push_back(std::move(level));
+                    m_partMeshes[shapeKey] = lodMesh;
+                }
+            }
+        }
+
+        buildSceneFromSTEP();
+        m_ui.setScene(m_scene);
+
+        // rebuildViewportMesh merges all parts, records index ranges,
+        // and populates pick parts for viewport selection.
+        rebuildViewportMesh();
+
+        MF_INFO("Viewport mesh: {} verts, {} tris, aabb center ({:.2f},{:.2f},{:.2f}) diag={:.2f}",
+                m_viewportMesh.vertexCount(),
+                m_viewportMesh.triangleCount(),
+                m_viewportMesh.aabb.center().x,
+                m_viewportMesh.aabb.center().y,
+                m_viewportMesh.aabb.center().z,
+                m_viewportMesh.aabb.diagonal());
+
+        size_t pos = filepath.find_last_of("/\\");
+        std::string filename = (pos != std::string::npos) ? filepath.substr(pos + 1) : filepath;
+        std::string title = "MeshForge - " + filename;
+        SDL_SetWindowTitle(m_window, title.c_str());
+        MF_INFO("Import successful: {} parts", m_stepResult->partsById.size());
+    } else {
+        MF_ERROR("Import failed: could not parse STEP file");
+    }
+}
+
+void Application::buildSceneFromSTEP() {
+    if (!m_stepResult || !m_stepResult->root) return;
+    m_scene->clear();
+    m_partNodeIds.clear();
+
+    std::function<void(const std::shared_ptr<AssemblyNode>&, SceneNode*)> build =
+        [&](const auto& anode, SceneNode* parent) {
+            auto type = (anode->type == AssemblyNode::Type::Assembly)
+                        ? SceneNode::Type::Group : SceneNode::Type::Mesh;
+            auto snode = std::make_shared<SceneNode>(anode->name, type);
+            snode->setLocalTransform(mat4ToTransform(anode->localTransform));
+
+            if (anode->isInstance && !anode->prototypeId.empty()) {
+                snode->setPrototype(m_scene->root());
+            }
+
+            // Attach mesh for part nodes and record partId -> sceneNodeId mapping
+            if (type == SceneNode::Type::Mesh) {
+                auto it = m_partMeshes.find(anode->shapeKey);
+                if (it != m_partMeshes.end()) {
+                    snode->setMesh(it->second);
+                }
+                // Store mapping for viewport pick (use AssemblyNode::id as key)
+                m_partNodeIds[anode->id] = snode->id();
+            }
+
+            parent->addChild(snode);
+            for (auto& child : anode->children) build(child, snode.get());
+        };
+
+    build(m_stepResult->root, m_scene->root().get());
+    m_scene->detectInstances();
+    MF_INFO("Scene built: {} nodes, {} part->node mappings",
+            m_stepResult->partsById.size(), m_partNodeIds.size());
+}
+
+void Application::processAll() {
+    if (m_config.useCADAwarePipeline) {
+        processCADAware();
+        return;
+    }
+
+    if (m_viewportMesh.triangleCount() == 0) {
+        MF_WARN("No mesh to process - load a STEP file first");
+        return;
+    }
+
+    auto task = std::make_shared<Task>("Simplify All", [this](Task* t) {
+        t->setProgress(0.05f); t->setMessage("Preparing simplification...");
+
+        SimplifyParams sp;
+        sp.targetRatio = 0.25f;
+        sp.targetError = 5e-2f;  // more permissive for batch simplification
+        sp.preserveBoundary = false;
+        sp.maxPasses = 2;
+        sp.useSloppyFallback = true;
+
+        size_t total = m_partSimplifyStates.size();
+        size_t idx = 0;
+        for (auto& [key, state] : m_partSimplifyStates) {
+            t->setProgress(0.05f + 0.7f * static_cast<float>(idx) / static_cast<float>(total));
+            t->setMessage("Simplifying: " + key);
+
+            auto sr = Simplifier::simplify(state.originalMesh, sp);
+            sr.mesh.computeNormals();
+            sr.mesh.computeTangents();
+            state.simplifiedMesh = std::move(sr.mesh);
+            state.isSimplified = true;
+
+            auto meshIt = m_partMeshes.find(key);
+            if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+                meshIt->second->lods[0].mesh = state.simplifiedMesh;
+            }
+            ++idx;
+        }
+
+        t->setProgress(0.85f);
+        m_viewportMeshDirty = true;
+
+        t->setProgress(1.0f);
+        MF_INFO("Simplification complete: {} parts processed", total);
+    });
+    TaskSystem::instance().submit(task);
+}
+
+void Application::processCADAware() {
+    if (m_viewportMesh.triangleCount() == 0) {
+        MF_WARN("No mesh to process - load a STEP file first");
+        return;
+    }
+
+    auto task = std::make_shared<Task>("CAD-Aware Pipeline", [this](Task* t) {
+        t->setProgress(0.05f); t->setMessage("Running feature-preserving simplification...");
+
+        size_t total = m_partSimplifyStates.size();
+        size_t idx = 0;
+        for (auto& [key, state] : m_partSimplifyStates) {
+            t->setProgress(0.05f + 0.6f * static_cast<float>(idx) / static_cast<float>(total));
+            t->setMessage("Feature simplifying: " + key);
+
+            SimplifyParams sp;
+            sp.targetRatio = m_config.featureSimplification.targetRatio;
+            sp.targetError = m_config.featureSimplification.maxError;
+            sp.preserveBoundary = m_config.featureSimplification.preserveBoundary;
+            sp.maxPasses = 2;
+            sp.useSloppyFallback = true;
+
+            SimplifyResult sr;
+            auto tagsIt = m_taggedMeshes.find(key);
+            if (tagsIt != m_taggedMeshes.end() && !tagsIt->second.triangleTags.empty()) {
+                sr = m_featureSimplifier.simplifyV2(
+                    state.originalMesh, sp, &tagsIt->second.triangleTags);
+            } else {
+                sr = m_featureSimplifier.simplifyV2(state.originalMesh, sp, nullptr);
+            }
+
+            sr.mesh.computeNormals();
+            sr.mesh.computeTangents();
+            state.simplifiedMesh = std::move(sr.mesh);
+            state.isSimplified = true;
+
+            auto meshIt = m_partMeshes.find(key);
+            if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+                meshIt->second->lods[0].mesh = state.simplifiedMesh;
+            }
+            ++idx;
+        }
+
+        t->setProgress(0.75f);
+        m_viewportMeshDirty = true;
+
+        t->setProgress(0.90f); t->setMessage("Generating stats...");
+
+        // Log pipeline statistics
+        size_t totalBefore = 0, totalAfter = 0;
+        for (auto& [key, state] : m_partSimplifyStates) {
+            totalBefore += state.originalMesh.triangleCount();
+            totalAfter += state.simplifiedMesh.triangleCount();
+        }
+        MF_INFO("CAD-Aware simplification: {} → {} triangles ({:.1f}% reduction)",
+                totalBefore, totalAfter,
+                totalBefore > 0 ? (1.0f - static_cast<float>(totalAfter)/static_cast<float>(totalBefore)) * 100.0f : 0.0f);
+
+        t->setProgress(1.0f);
+    });
+    TaskSystem::instance().submit(task);
+}
+
+void Application::simplifySelected(const std::vector<std::shared_ptr<SceneNode>>& nodes,
+                                    const SimplifyParams& params) {
+    if (nodes.empty()) {
+        MF_WARN("No nodes selected for simplification");
+        return;
+    }
+
+    MF_INFO("simplifySelected: mode={}, ratio={:.3f}, fileSize={:.2f}MB, error={:.4f}, "
+            "boundary={}, sloppy={}, nodes={}",
+            (params.mode == SimplifyMode::Ratio) ? "Ratio" : "FileSize",
+            params.targetRatio, params.targetFileSizeMB,
+            params.targetError, params.preserveBoundary,
+            params.useSloppyFallback, nodes.size());
+
+    auto task = std::make_shared<Task>("Simplify Selected", [this, nodes, params](Task* t) {
+        t->setProgress(0.0f); t->setMessage("Simplifying selected parts...");
+
+        size_t total = nodes.size();
+        size_t processed = 0;
+        size_t totalBefore = 0, totalAfter = 0;
+
+        for (auto& node : nodes) {
+            if (!node->mesh() || node->mesh()->lods.empty()) continue;
+
+            const auto& lodMesh = node->mesh();
+            std::string key = lodMesh->name;
+
+            // ALWAYS simplify from the original mesh. This is the most reliable
+            // strategy: meshopt_simplify works best on the full tessellation,
+            // and repeated simplifications of an already-simplified mesh produce
+            // poor results.  The target ratio is always relative to original.
+            auto stateIt = m_partSimplifyStates.find(key);
+            const MeshData* source = nullptr;
+            if (stateIt != m_partSimplifyStates.end()) {
+                source = &stateIt->second.originalMesh;
+            } else {
+                source = &lodMesh->lods[0].mesh;
+            }
+
+            if (source->triangleCount() == 0) {
+                MF_WARN("Skipping '{}' — source mesh has 0 triangles", node->name());
+                continue;
+            }
+
+            // Compute the effective ratio (relative to original)
+            float effectiveRatio = params.targetRatio;
+            if (params.mode == SimplifyMode::TargetFileSizeMB) {
+                effectiveRatio = ratioForTargetFileSize(*source, params.targetFileSizeMB);
+                MF_INFO("FileSize mode: targetMB={:.2f} -> ratio={:.3f} for '{}'",
+                        params.targetFileSizeMB, effectiveRatio, node->name());
+            }
+
+            // Clamp and validate
+            effectiveRatio = std::clamp(effectiveRatio, 0.005f, 1.0f);
+            if (effectiveRatio >= 1.0f) {
+                MF_INFO("Part '{}' effective ratio {:.3f} >= 1.0, skipping", node->name(), effectiveRatio);
+                ++processed;
+                continue;
+            }
+
+            t->setMessage("Simplifying: " + node->name());
+            totalBefore += source->triangleCount();
+
+            // Run simplification
+            SimplifyResult sr;
+            if (m_config.useCADAwarePipeline) {
+                auto tagsIt = m_taggedMeshes.find(key);
+                SimplifyParams sp = params;
+                sp.targetRatio = effectiveRatio;
+
+                if (tagsIt != m_taggedMeshes.end() && !tagsIt->second.triangleTags.empty()) {
+                    sr = m_featureSimplifier.simplifyV2(*source, sp, &tagsIt->second.triangleTags);
+                } else {
+                    sr = m_featureSimplifier.simplifyV2(*source, sp, nullptr);
+                }
+            } else {
+                SimplifyParams sp = params;
+                sp.targetRatio = effectiveRatio;
+                sr = Simplifier::simplify(*source, sp);
+            }
+
+            sr.mesh.computeNormals();
+            sr.mesh.computeTangents();
+            totalAfter += sr.mesh.triangleCount();
+
+            MF_INFO("Part '{}' simplified: {} -> {} tris (target {:.3f}, achieved {:.3f}, "
+                    "error {:.4f}, sloppy={}, passes={})",
+                    node->name(), source->triangleCount(), sr.mesh.triangleCount(),
+                    effectiveRatio, sr.achievedRatio,
+                    sr.usedError, sr.usedSloppy, sr.passes);
+
+            // Save current simplified state to history before overwriting
+            if (stateIt != m_partSimplifyStates.end()) {
+                if (stateIt->second.isSimplified && !stateIt->second.simplifiedMesh.vertices.empty()) {
+                    stateIt->second.history.push_back(std::move(stateIt->second.simplifiedMesh));
+                }
+                stateIt->second.simplifiedMesh = std::move(sr.mesh);
+                stateIt->second.isSimplified = true;
+
+                auto meshIt = m_partMeshes.find(key);
+                if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+                    meshIt->second->lods[0].mesh = stateIt->second.simplifiedMesh;
+                }
+            } else {
+                auto meshIt = m_partMeshes.find(key);
+                if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+                    meshIt->second->lods[0].mesh = std::move(sr.mesh);
+                }
+            }
+
+            ++processed;
+            t->setProgress(static_cast<float>(processed) / static_cast<float>(total));
+        }
+
+        t->setProgress(0.95f);
+        m_viewportMeshDirty = true;
+        t->setProgress(1.0f);
+        MF_INFO("Simplification complete: {} parts, {} -> {} tris ({:.1f}% reduction)",
+                processed, totalBefore, totalAfter,
+                totalBefore > 0 ? (1.0f - static_cast<float>(totalAfter) / static_cast<float>(totalBefore)) * 100.0f : 0.0f);
+    });
+
+    m_processing = true;
+    TaskSystem::instance().submit(task);
+}
+
+void Application::rebuildViewportMesh() {
+    if (!m_stepResult) return;
+
+    m_viewportMesh.clear();
+    m_partIndexRanges.clear();
+    for (auto& [id, part] : m_stepResult->partsById) {
+        auto meshIt = m_partMeshes.find(part->shapeKey);
+        if (meshIt == m_partMeshes.end()) continue;
+
+        // Compute world transform
+        Mat4 world(1.0f);
+        auto p = part;
+        while (p && p->type != AssemblyNode::Type::Root) {
+            world = p->localTransform * world;
+            p = p->parent;
+        }
+
+        // Use simplified mesh if available, otherwise original
+        const MeshData* localMesh = nullptr;
+        auto stateIt = m_partSimplifyStates.find(part->shapeKey);
+        if (stateIt != m_partSimplifyStates.end() && stateIt->second.isSimplified) {
+            localMesh = &stateIt->second.simplifiedMesh;
+        } else {
+            localMesh = &meshIt->second->lods[0].mesh;
+        }
+
+        uint32_t vertOffset = static_cast<uint32_t>(m_viewportMesh.vertices.size());
+        uint32_t idxOffset  = static_cast<uint32_t>(m_viewportMesh.indices.size());
+
+        for (const auto& v : localMesh->vertices) {
+            Vertex wv = v;
+            wv.position = Vec3(world * Vec4(v.position, 1.0f));
+            wv.normal = glm::normalize(Vec3(world * Vec4(v.normal, 0.0f)));
+            m_viewportMesh.vertices.push_back(wv);
+        }
+        for (auto idx : localMesh->indices) {
+            m_viewportMesh.indices.push_back(vertOffset + idx);
+        }
+
+        uint32_t idxCount = static_cast<uint32_t>(m_viewportMesh.indices.size()) - idxOffset;
+        m_partIndexRanges[id] = {idxOffset, idxCount};
+    }
+
+    if (!m_viewportMesh.vertices.empty()) {
+        m_viewportMesh.computeAABB();
+        m_ui.setMeshForViewport(&m_viewportMesh);
+
+        // Build per-part pick info for viewport selection
+        std::vector<ViewportPanel::PartPickInfo> pickParts;
+        for (auto& [pid, range] : m_partIndexRanges) {
+            AABB partAABB;
+            for (uint32_t i = range.first; i < range.first + range.second && i < m_viewportMesh.indices.size(); ++i) {
+                uint32_t vi = m_viewportMesh.indices[i];
+                if (vi < m_viewportMesh.vertexCount())
+                    partAABB.expand(m_viewportMesh.vertices[vi].position);
+            }
+            ViewportPanel::PartPickInfo info;
+            info.indexOffset = range.first;
+            info.indexCount = range.second;
+            info.worldAABB = partAABB;
+
+            // Use direct partId -> sceneNodeId mapping built in buildSceneFromSTEP
+            auto nidIt = m_partNodeIds.find(pid);
+            if (nidIt != m_partNodeIds.end()) {
+                info.sceneNodeId = nidIt->second;
+            }
+
+            auto pit = m_stepResult->partsById.find(pid);
+            if (pit != m_stepResult->partsById.end()) {
+                info.meshName = pit->second->shapeKey;
+            }
+            pickParts.push_back(std::move(info));
+        }
+        m_ui.setViewportPickParts(pickParts);
+    }
+}
+
+void Application::undoSpecific(const std::vector<std::shared_ptr<SceneNode>>& nodes) {
+    if (nodes.empty()) return;
+
+    auto task = std::make_shared<Task>("Undo Simplify", [this, nodes](Task* t) {
+        t->setProgress(0.0f); t->setMessage("Undoing simplification...");
+        size_t undone = 0;
+        for (auto& node : nodes) {
+            if (!node->mesh() || node->mesh()->lods.empty()) continue;
+            std::string key = node->mesh()->name;
+
+            auto stateIt = m_partSimplifyStates.find(key);
+            if (stateIt == m_partSimplifyStates.end()) continue;
+            if (stateIt->second.history.empty()) {
+                MF_INFO("No history for '{}', cannot undo", node->name());
+                continue;
+            }
+
+            // Pop most recent from history and restore
+            stateIt->second.simplifiedMesh = std::move(stateIt->second.history.back());
+            stateIt->second.history.pop_back();
+
+            auto meshIt = m_partMeshes.find(key);
+            if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+                meshIt->second->lods[0].mesh = stateIt->second.simplifiedMesh;
+            }
+            ++undone;
+            MF_INFO("Undo for '{}': restored to {} tris (history remaining: {})",
+                    node->name(), stateIt->second.simplifiedMesh.triangleCount(),
+                    stateIt->second.history.size());
+        }
+        m_viewportMeshDirty = true;
+        t->setProgress(1.0f);
+        MF_INFO("Undo: {} parts restored", undone);
+    });
+    TaskSystem::instance().submit(task);
+}
+
+// ------------------------------------------------------------------
+// Bounding proxy: replace mesh with simplified bounding geometry
+// ------------------------------------------------------------------
+void Application::applyBoundingProxy(const std::vector<std::shared_ptr<SceneNode>>& nodes,
+                                      float margin, int geomType) {
+    if (nodes.empty()) return;
+
+    for (auto& node : nodes) {
+        if (!node->mesh() || node->mesh()->lods.empty()) continue;
+        const auto& lodMesh = node->mesh();
+        std::string key = lodMesh->name;
+        const auto& source = lodMesh->lods[0].mesh;
+        if (source.vertexCount() == 0) continue;
+
+        // Compute world AABB from current mesh vertices (already in world space if this is the viewport copy)
+        // Use the part index range AABB or the mesh AABB
+        AABB aabb = source.aabb;
+        if (aabb.isEmpty()) continue;
+
+        // Apply margin
+        Vec3 center = aabb.center();
+        Vec3 halfExt = aabb.extent() * 0.5f * (1.0f + margin);
+        AABB expandedAABB;
+        expandedAABB.min = center - halfExt;
+        expandedAABB.max = center + halfExt;
+
+        // Generate proxy mesh
+        MeshData proxy;
+        if (geomType == 0) { // Box
+            // 8 vertices + 12 triangles
+            Vec3 corners[8] = {
+                {expandedAABB.min.x, expandedAABB.min.y, expandedAABB.min.z},
+                {expandedAABB.max.x, expandedAABB.min.y, expandedAABB.min.z},
+                {expandedAABB.max.x, expandedAABB.max.y, expandedAABB.min.z},
+                {expandedAABB.min.x, expandedAABB.max.y, expandedAABB.min.z},
+                {expandedAABB.min.x, expandedAABB.min.y, expandedAABB.max.z},
+                {expandedAABB.max.x, expandedAABB.min.y, expandedAABB.max.z},
+                {expandedAABB.max.x, expandedAABB.max.y, expandedAABB.max.z},
+                {expandedAABB.min.x, expandedAABB.max.y, expandedAABB.max.z}};
+            for (int i = 0; i < 8; ++i) {
+                Vertex v; v.position = corners[i]; v.normal = Vec3(0,1,0); v.uv = Vec2(0,0); v.tangent = Vec4(1,0,0,1);
+                proxy.vertices.push_back(v);
+            }
+            int faces[12][3] = {{0,2,1},{0,3,2},{4,5,6},{4,6,7},{0,1,5},{0,5,4},
+                               {2,3,7},{2,7,6},{1,2,6},{1,6,5},{3,0,4},{3,4,7}};
+            for (auto& f : faces) {
+                proxy.indices.push_back(f[0]); proxy.indices.push_back(f[1]); proxy.indices.push_back(f[2]);
+            }
+            proxy.computeNormals();
+        } else if (geomType == 1) { // Sphere
+            uint32_t slices = 16, stacks = 8;
+            for (uint32_t si = 0; si <= stacks; ++si) {
+                float phi = 3.14159f * si / stacks;
+                for (uint32_t ci = 0; ci < slices; ++ci) {
+                    float theta = 2.0f * 3.14159f * ci / slices;
+                    Vec3 n(std::sin(phi)*std::cos(theta), std::cos(phi), std::sin(phi)*std::sin(theta));
+                    Vec3 p = center + halfExt * n;
+                    Vertex v; v.position = p; v.normal = n; v.uv = Vec2((float)ci/slices, (float)si/stacks);
+                    v.tangent = Vec4(1,0,0,1); proxy.vertices.push_back(v);
+                }
+            }
+            for (uint32_t si = 0; si < stacks; ++si)
+                for (uint32_t ci = 0; ci < slices; ++ci) {
+                    uint32_t a = si*slices+ci, b = si*slices+(ci+1)%slices;
+                    uint32_t c = (si+1)*slices+ci, d = (si+1)*slices+(ci+1)%slices;
+                    proxy.indices.push_back(a);proxy.indices.push_back(b);proxy.indices.push_back(c);
+                    proxy.indices.push_back(b);proxy.indices.push_back(d);proxy.indices.push_back(c);
+                }
+        } else { // Cylinder
+            uint32_t slices = 16;
+            Vec3 axis(0,1,0);
+            Vec3 u(1,0,0), v(0,0,1);
+            float r = std::max(halfExt.x, halfExt.z);
+            float h = halfExt.y * 2.0f;
+            Vec3 base = center - Vec3(0, halfExt.y, 0);
+            for (uint32_t si = 0; si <= 1; ++si) {
+                Vec3 c = base + axis * (si * h);
+                for (uint32_t ci = 0; ci < slices; ++ci) {
+                    float angle = 2.0f*3.14159f*ci/slices;
+                    Vec3 p = c + r*(u*std::cos(angle)+v*std::sin(angle));
+                    Vec3 n = glm::normalize(u*std::cos(angle)+v*std::sin(angle));
+                    Vertex vt; vt.position = p; vt.normal = n;
+                    vt.uv = Vec2((float)ci/slices, (float)si); vt.tangent = Vec4(1,0,0,1);
+                    proxy.vertices.push_back(vt);
+                }
+            }
+            for (uint32_t ci = 0; ci < slices; ++ci) {
+                uint32_t a=ci, b=(ci+1)%slices, c=slices+ci, d=slices+(ci+1)%slices;
+                proxy.indices.push_back(a);proxy.indices.push_back(b);proxy.indices.push_back(c);
+                proxy.indices.push_back(b);proxy.indices.push_back(d);proxy.indices.push_back(c);
+            }
+        }
+        proxy.computeAABB();
+
+        // Replace the part's mesh
+        auto stateIt = m_partSimplifyStates.find(key);
+        if (stateIt != m_partSimplifyStates.end()) {
+            stateIt->second.originalMesh = proxy;
+            stateIt->second.simplifiedMesh = proxy;
+            stateIt->second.isSimplified = true;
+        }
+        auto meshIt = m_partMeshes.find(key);
+        if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+            meshIt->second->lods[0].mesh = proxy;
+        }
+    }
+
+    rebuildViewportMesh();
+    MF_INFO("Bounding proxy applied to {} parts", nodes.size());
+}
+
+void Application::resetToOriginal(const std::vector<std::shared_ptr<SceneNode>>& nodes) {
+    if (nodes.empty()) return;
+
+    auto task = std::make_shared<Task>("Reset to Original", [this, nodes](Task* t) {
+        t->setProgress(0.0f); t->setMessage("Resetting to original...");
+        size_t reset = 0;
+        for (auto& node : nodes) {
+            if (!node->mesh() || node->mesh()->lods.empty()) continue;
+            std::string key = node->mesh()->name;
+
+            auto stateIt = m_partSimplifyStates.find(key);
+            if (stateIt == m_partSimplifyStates.end()) continue;
+            if (!stateIt->second.isSimplified) continue;
+
+            stateIt->second.simplifiedMesh = MeshData{};
+            stateIt->second.isSimplified = false;
+            stateIt->second.history.clear();
+
+            auto meshIt = m_partMeshes.find(key);
+            if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+                meshIt->second->lods[0].mesh = stateIt->second.originalMesh;
+            }
+            ++reset;
+        }
+        m_viewportMeshDirty = true;
+        t->setProgress(1.0f);
+        MF_INFO("Reset: {} parts restored to original", reset);
+    });
+    TaskSystem::instance().submit(task);
+}
+
+void Application::batchExportSelected(const std::vector<std::shared_ptr<SceneNode>>& nodes) {
+    // Each selected node's IMMEDIATE children are exported as separate files.
+    // If a child is a Group (sub-assembly), it is exported as a whole merged file
+    // (its grandchildren are NOT further split).
+
+    if (nodes.empty()) {
+        MF_WARN("No nodes selected for batch export");
+        return;
+    }
+
+    // Get a directory
+    std::string dirPath = m_ui.saveFileDialog(false);
+    if (dirPath.empty()) return;
+
+    std::string baseDir = dirPath.substr(0, dirPath.find_last_of('.'));
+    if (baseDir.empty()) baseDir = dirPath + "_parts";
+
+    std::string mkdir_cmd = "mkdir -p \"" + baseDir + "\"";
+    system(mkdir_cmd.c_str());
+
+    STLExporter stlExporter;
+    size_t exported = 0;
+
+    for (auto& node : nodes) {
+        // For each selected node, iterate its IMMEDIATE children only
+        for (auto& child : node->children()) {
+            // Merge this child + all its descendants into one mesh
+            MeshData merged;
+            child->traverse([&merged](SceneNode* descendant) {
+                if (descendant->type() == SceneNode::Type::Mesh && descendant->mesh()
+                    && !descendant->mesh()->lods.empty()) {
+                    const auto& md = descendant->mesh()->lods[0].mesh;
+                    if (md.vertices.empty()) return;
+
+                    uint32_t off = static_cast<uint32_t>(merged.vertices.size());
+                    Mat4 w = descendant->worldTransform();
+                    for (const auto& v : md.vertices) {
+                        Vertex wv = v;
+                        wv.position = Vec3(w * Vec4(v.position, 1.0f));
+                        wv.normal  = glm::normalize(Vec3(w * Vec4(v.normal, 0.0f)));
+                        merged.vertices.push_back(wv);
+                    }
+                    for (auto idx : md.indices) {
+                        merged.indices.push_back(off + idx);
+                    }
+                }
+            });
+
+            if (merged.vertices.empty()) continue;
+            merged.computeAABB();
+
+            std::string safeName = child->name();
+            for (auto& c : safeName) {
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-')
+                    c = '_';
+            }
+            if (safeName.empty()) safeName = "part";
+
+            std::string stlPath = baseDir + "/" + safeName + ".stl";
+            if (stlExporter.exportMesh(merged, stlPath, safeName)) {
+                MF_INFO("  Exported '{}' ({} tris) -> {}", child->name(),
+                        merged.triangleCount(), stlPath);
+                ++exported;
+            }
+        }
+    }
+
+    MF_INFO("Batch export: {} parts written to '{}'", exported, baseDir);
+}
+
+// NOTE: Runs synchronously on the main thread to avoid data races
+// between background task workers and the UI thread.
+void Application::deleteSelected(const std::vector<std::shared_ptr<SceneNode>>& nodes) {
+    if (nodes.empty() || !m_stepResult || !m_scene) return;
+
+    MF_INFO("Deleting {} selected parts...", nodes.size());
+
+    std::unordered_set<std::string> removedPartIds;
+    std::unordered_set<std::string> candidateShapeKeys;
+
+    for (auto& node : nodes) {
+        if (!node) continue;
+
+        std::string key = node->mesh() ? node->mesh()->name : "";
+        for (auto& [partId, part] : m_stepResult->partsById) {
+            if (part->shapeKey == key) {
+                removedPartIds.insert(partId);
+                candidateShapeKeys.insert(key);
+                break;
+            }
+        }
+
+        // Remove from scene tree
+        if (auto parent = node->parent()) {
+            parent->removeChild(node);
+        }
+    }
+
+    // Erase removed parts
+    for (auto& pid : removedPartIds) {
+        m_stepResult->partsById.erase(pid);
+        m_partIndexRanges.erase(pid);
+        m_partNodeIds.erase(pid);
+    }
+
+    // Clean up orphaned shapes
+    for (auto& sk : candidateShapeKeys) {
+        bool stillUsed = false;
+        for (auto& [pid, p] : m_stepResult->partsById) {
+            if (p->shapeKey == sk) { stillUsed = true; break; }
+        }
+        if (!stillUsed) {
+            m_partMeshes.erase(sk);
+            m_partSimplifyStates.erase(sk);
+            m_taggedMeshes.erase(sk);
+            m_stepResult->shapesByKey.erase(sk);
+        }
+    }
+
+    // Defer viewport rebuild — modifying OpenGL buffers during the current
+    // frame's draw would overwrite data the GPU is still processing.
+    m_viewportMeshDirty = true;
+
+    MF_INFO("Deleted {} parts", removedPartIds.size());
+}
+
+// ------------------------------------------------------------------
+// Group: merge selected parts into a new Group node
+// ------------------------------------------------------------------
+void Application::groupSelected(const std::vector<std::shared_ptr<SceneNode>>& nodes) {
+    if (nodes.size() < 2) {
+        MF_WARN("Need at least 2 nodes to group");
+        return;
+    }
+    if (!m_scene) return;
+
+    // Find common parent
+    auto commonParent = nodes[0]->parent();
+    if (!commonParent) commonParent = m_scene->root();
+    for (size_t i = 1; i < nodes.size(); ++i) {
+        if (nodes[i]->parent() != commonParent) {
+            MF_WARN("Selected nodes must share the same parent");
+            return;
+        }
+    }
+
+    auto task = std::make_shared<Task>("Group Parts", [this, nodes, commonParent](Task* t) {
+        t->setProgress(0.0f); t->setMessage("Merging parts...");
+
+        // Create merged group node
+        auto groupNode = std::make_shared<SceneNode>("MergedGroup", SceneNode::Type::Group);
+        groupNode->setLocalTransform(mat4ToTransform(Mat4(1.0f)));
+
+        // Create merged mesh from all selected nodes
+        MeshData mergedMesh;
+        for (auto& node : nodes) {
+            if (!node->mesh() || node->mesh()->lods.empty()) continue;
+            const auto& md = node->mesh()->lods[0].mesh;
+            Mat4 world = node->worldTransform();
+
+            uint32_t off = static_cast<uint32_t>(mergedMesh.vertices.size());
+            for (const auto& v : md.vertices) {
+                Vertex wv = v;
+                wv.position = Vec3(world * Vec4(v.position, 1.0f));
+                wv.normal = glm::normalize(Vec3(world * Vec4(v.normal, 0.0f)));
+                mergedMesh.vertices.push_back(wv);
+            }
+            for (auto idx : md.indices) {
+                mergedMesh.indices.push_back(off + idx);
+            }
+        }
+        mergedMesh.computeAABB();
+
+        t->setProgress(0.5f); t->setMessage("Building scene structure...");
+
+        // Attach merged mesh to group node
+        auto mergedLOD = std::make_shared<LODMesh>();
+        mergedLOD->name = "MergedGroup_mesh";
+        LODLevel l0;
+        l0.level = 0;
+        l0.mesh = std::move(mergedMesh);
+        mergedLOD->lods.push_back(std::move(l0));
+        groupNode->setMesh(mergedLOD);
+
+        // Store in part meshes for viewport
+        m_partMeshes["MergedGroup_mesh"] = mergedLOD;
+
+        // Move selected nodes as children of the group
+        for (auto& node : nodes) {
+            commonParent->removeChild(node);
+            groupNode->addChild(node);
+        }
+
+        // Add group to common parent
+        commonParent->addChild(groupNode);
+
+        t->setProgress(0.8f); t->setMessage("Rebuilding viewport...");
+        m_viewportMeshDirty = true;
+        t->setProgress(1.0f);
+        MF_INFO("Grouped {} parts into MergedGroup", nodes.size());
+    });
+    TaskSystem::instance().submit(task);
+}
+
+void Application::exportglTF(const std::string& filepath) {
+    glTFExporter exporter;
+    if (exporter.exportScene(*m_scene, filepath, m_config.exportOpt)) {
+        MF_INFO("Exported to {}", filepath);
+    } else {
+        MF_ERROR("Export failed");
+    }
+}
+
+void Application::exportSTL(const std::string& filepath) {
+    STLExporter exporter;
+    if (exporter.exportScene(*m_scene, filepath)) {
+        MF_INFO("Exported STL to {}", filepath);
+    } else {
+        MF_ERROR("STL Export failed");
+    }
+}
+
+bool Application::isProcessing() const { return m_processing; }
+float Application::progress() const { return m_progress; }
+
+} // namespace mf

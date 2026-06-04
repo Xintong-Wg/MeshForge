@@ -1,0 +1,25 @@
+# Build directory
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Test models (large files)
+test_model/
+*.stp
+*.STEP
+
+# Cache
+.cache/
+
+# Claude
+.claude/

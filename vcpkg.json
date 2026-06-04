@@ -1,0 +1,23 @@
+{
+  "name": "meshforge",
+  "version": "0.1.0",
+  "description": "Industrial STEP model lightweight processing software",
+  "license": "MIT",
+  "dependencies": [
+    "eigen3",
+    "tbb",
+    "meshoptimizer",
+    "draco",
+    {
+      "name": "imgui",
+      "features": ["docking-experimental"]
+    },
+    "bgfx",
+    "glm",
+    "spdlog",
+    "nlohmann-json"
+  ],
+  "overrides": [
+  ],
+  "builtin-baseline": "9b965a116838c6cdcd36bca60d1b81b030c8ab8d"
+}
