@@ -32,7 +32,9 @@ struct PipelineConfig {
     LODGenerator::Params lod;
     glTFExportOptions exportOpt;
     std::string cacheDir = "./cache";
-    bool useCADAwarePipeline = true;  // enable new pipeline
+    bool useCADAwarePipeline = false; // CAD-aware analysis + adaptive tessellation
+    bool useFastImport = true;        // skip shell extraction, parallel tessellation
+    int importThreads = 0;            // 0 = auto (use all cores)
 };
 
 // Per-part simplification state

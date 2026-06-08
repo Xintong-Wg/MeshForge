@@ -138,9 +138,12 @@ public:
     void refresh();  // force re-upload mesh to GPU
     void processInput();  // handle camera + mouse pick (call before draw)
 
-    // Highlight a range of triangles (index offset + count) in the mesh
+    // Highlight
     void setHighlightRange(uint32_t indexOffset, uint32_t indexCount);
+    void setHighlightRanges(const std::vector<std::pair<uint32_t,uint32_t>>& ranges);
     void clearHighlight();
+    const std::vector<std::pair<uint32_t,uint32_t>>& selectedFaceRanges() const { return m_selectedFaceRanges; }
+    void clearSelectedFaces() { m_selectedFaceRanges.clear(); }
 
     // Per-part info for viewport selection (point / box pick)
     struct PartPickInfo {
@@ -151,6 +154,11 @@ public:
         AABB worldAABB;
     };
     void setPickParts(const std::vector<PartPickInfo>& parts);
+
+    // Selection mode
+    enum class SelectionMode { Part, MeshFace };
+    void setSelectionMode(SelectionMode m) { m_selMode = m; }
+    SelectionMode selectionMode() const { return m_selMode; }
 
     // Selection callback: viewport -> scene tree
     using SelectionCallback = std::function<void(const std::vector<EntityId>&)>;
@@ -191,6 +199,10 @@ private:
     // FBO image position (screen coords) — set in render3D, used in pick
     float m_vpImgOriginX = 0, m_vpImgOriginY = 0;
     float m_vpImgW = 0, m_vpImgH = 0;
+
+    // Selection state
+    SelectionMode m_selMode = SelectionMode::Part;
+    std::vector<std::pair<uint32_t, uint32_t>> m_selectedFaceRanges; // {offset, count} pairs
 
     // Camera orbit state
     float m_yaw = 0.5f, m_pitch = 0.3f, m_distance = 5.0f;
@@ -271,6 +283,8 @@ public:
     void refreshViewport();
     void setHighlightForViewport(uint32_t offset, uint32_t count);
     void clearViewportHighlight();
+    void clearViewportFaceRanges();
+    ViewportPanel::SelectionMode viewportSelectionMode() const;
     void setViewportPickParts(const std::vector<ViewportPanel::PartPickInfo>& parts);
     void setViewportSelectionCallback(ViewportPanel::SelectionCallback cb);
     void setActionCallbacks(const ActionCallbacks& cb) { m_actionCallbacks = cb; }

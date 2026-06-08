@@ -20,19 +20,18 @@ using AssemblyNodePtr = std::shared_ptr<AssemblyNode>;
 struct AssemblyNode {
     enum class Type { Root, Assembly, Part };
 
-    std::string id;          // STEP entity tag or generated UUID
+    std::string id;
     std::string name;
-    std::string stepId;      // Original STEP #id
+    std::string stepId;
     Type type = Type::Part;
     Mat4 localTransform = Mat4(1.0f);
 
     std::vector<AssemblyNodePtr> children;
     AssemblyNodePtr parent;
 
-    // For parts: link to shape definition for meshing
     std::string shapeKey;
-    bool isInstance = false; // true if this is a placement of a shared shape
-    std::string prototypeId; // for instances: points to the original shape/part
+    bool isInstance = false;
+    std::string prototypeId;
 };
 
 // ------------------------------------------------------------------
@@ -41,24 +40,24 @@ struct AssemblyNode {
 struct STEPResult {
     AssemblyNodePtr root;
     std::unordered_map<std::string, AssemblyNodePtr> partsById;
-    std::unordered_map<std::string, std::vector<AssemblyNodePtr>> instances; // prototypeId -> placements
-    std::unordered_map<std::string, TopoDS_Shape> shapesByKey;              // shapeKey -> TopoDS_Shape
+    std::unordered_map<std::string, std::vector<AssemblyNodePtr>> instances;
+    std::unordered_map<std::string, TopoDS_Shape> shapesByKey;
     size_t entityCount = 0;
     double fileScale = 1.0;
 };
 
 // ------------------------------------------------------------------
-// STEP reader using OpenCASCADE
+// STEP reader with BRep binary cache
 // ------------------------------------------------------------------
 class STEPReader {
 public:
     STEPReader();
     ~STEPReader();
 
-    // Parse a STEP file into assembly tree
-    std::shared_ptr<STEPResult> read(const std::string& filepath);
+    // Parse a STEP file (uses cache if available)
+    std::shared_ptr<STEPResult> read(const std::string& filepath,
+                                     const std::string& cacheDir = "");
 
-    // Streaming parse: read header, count entities, prepare for chunk processing
     bool probe(const std::string& filepath, size_t& outEntityCount);
 
 private:

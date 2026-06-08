@@ -31,10 +31,13 @@
 #include <opencascade/Standard_Integer.hxx>
 #include <opencascade/Standard_Failure.hxx>
 #include <opencascade/TopLoc_Location.hxx>
+#include <opencascade/BRepTools.hxx>
+#include <nlohmann/json.hpp>
 
 #include <fstream>
 #include <sstream>
 #include <stack>
+#include <filesystem>
 
 namespace mf {
 
@@ -75,18 +78,23 @@ class STEPReader::Impl {
 public:
     std::shared_ptr<STEPResult> result;
 
-    std::shared_ptr<STEPResult> read(const std::string& filepath);
+    std::shared_ptr<STEPResult> read(const std::string& filepath, const std::string& cacheDir);
     void traverseAssembly(const Handle(XCAFDoc_ShapeTool)& shapeTool,
                           const TDF_Label& label,
                           AssemblyNodePtr parent,
                           const Mat4& parentTransform);
+
+    // BRep binary cache
+    bool loadFromCache(const std::string& cacheDir);
+    void saveToCache(const std::string& cacheDir);
 };
 
 STEPReader::STEPReader() : m_impl(std::make_unique<Impl>()) {}
 STEPReader::~STEPReader() = default;
 
-std::shared_ptr<STEPResult> STEPReader::read(const std::string& filepath) {
-    return m_impl->read(filepath);
+std::shared_ptr<STEPResult> STEPReader::read(const std::string& filepath,
+                                              const std::string& cacheDir) {
+    return m_impl->read(filepath, cacheDir);
 }
 
 bool STEPReader::probe(const std::string& filepath, size_t& outEntityCount) {
@@ -103,7 +111,15 @@ bool STEPReader::probe(const std::string& filepath, size_t& outEntityCount) {
     return true;
 }
 
-std::shared_ptr<STEPResult> STEPReader::Impl::read(const std::string& filepath) {
+std::shared_ptr<STEPResult> STEPReader::Impl::read(const std::string& filepath,
+                                                    const std::string& cacheDir) {
+    // Try BRep binary cache first (instant load)
+    if (!cacheDir.empty() && loadFromCache(cacheDir)) {
+        MF_INFO("STEP loaded from BRep cache: {} parts, {} shapes",
+                result->partsById.size(), result->shapesByKey.size());
+        return result;
+    }
+
     result = std::make_shared<STEPResult>();
 
     // Use STEPCAFControl_Reader to preserve assembly hierarchy
@@ -257,6 +273,11 @@ std::shared_ptr<STEPResult> STEPReader::Impl::read(const std::string& filepath) 
                 rootLabels.Length(), result->partsById.size(), result->instances.size());
     }
 
+    // Save to BRep binary cache for next time (instant reload)
+    if (!cacheDir.empty()) {
+        saveToCache(cacheDir);
+    }
+
     return result;
 }
 
@@ -322,6 +343,163 @@ void STEPReader::Impl::traverseAssembly(const Handle(XCAFDoc_ShapeTool)& shapeTo
         parent->children.push_back(node);
         node->parent = parent;
         result->partsById[node->id] = node;
+    }
+}
+
+// ------------------------------------------------------------------
+// BRep binary cache: load assembly tree + shapes from disk
+// ------------------------------------------------------------------
+bool STEPReader::Impl::loadFromCache(const std::string& cacheDir) {
+    std::string jsonPath = cacheDir + "/assembly.json";
+    if (!std::filesystem::exists(jsonPath)) return false;
+
+    try {
+        std::ifstream jin(jsonPath);
+        if (!jin) return false;
+        nlohmann::json j;
+        jin >> j;
+
+        result = std::make_shared<STEPResult>();
+        result->entityCount = j.value("entityCount", size_t(0));
+        result->fileScale = j.value("fileScale", 1.0);
+
+        // Reconstruct part nodes
+        std::unordered_map<std::string, AssemblyNodePtr> nodeMap;
+        for (auto& [pid, pj] : j["parts"].items()) {
+            auto node = std::make_shared<AssemblyNode>();
+            node->id = pj.value("id", pid);
+            node->name = pj.value("name", "Unnamed");
+            node->type = static_cast<AssemblyNode::Type>(pj.value("type", 0));
+            node->shapeKey = pj.value("shapeKey", "");
+            node->isInstance = pj.value("isInstance", false);
+            node->prototypeId = pj.value("prototypeId", "");
+            if (pj.contains("transform")) {
+                auto& tj = pj["transform"];
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        node->localTransform[c][r] = tj[r * 4 + c].get<float>();
+            }
+            nodeMap[node->id] = node;
+            result->partsById[node->id] = node;
+        }
+
+        // Rebuild parent-child links
+        for (auto& [pid, pj] : j["parts"].items()) {
+            auto& node = nodeMap[pid];
+            std::string pId = pj.value("parentId", "");
+            if (!pId.empty() && pId != "root") {
+                auto pit = nodeMap.find(pId);
+                if (pit != nodeMap.end()) {
+                    node->parent = pit->second;
+                    pit->second->children.push_back(node);
+                }
+            }
+        }
+
+        // Root node
+        result->root = std::make_shared<AssemblyNode>();
+        result->root->id = "root";
+        result->root->name = "Root";
+        result->root->type = AssemblyNode::Type::Root;
+        for (auto& rid : j.value("rootChildren", std::vector<std::string>{})) {
+            auto it = nodeMap.find(rid);
+            if (it != nodeMap.end()) {
+                result->root->children.push_back(it->second);
+                it->second->parent = result->root;
+            }
+        }
+
+        // Instances
+        if (j.contains("instances")) {
+            for (auto& [protoId, ids] : j["instances"].items()) {
+                for (auto& id : ids) {
+                    auto it = nodeMap.find(id.get<std::string>());
+                    if (it != nodeMap.end())
+                        result->instances[protoId].push_back(it->second);
+                }
+            }
+        }
+
+        // Load shapes from .brep files
+        std::string shapesDir = cacheDir + "/shapes";
+        size_t n = 0;
+        for (auto& [key, node] : result->partsById) {
+            if (node->shapeKey.empty()) continue;
+            std::string brepPath = shapesDir + "/" + node->shapeKey + ".brep";
+            TopoDS_Shape shp;
+            BRep_Builder b;
+            if (BRepTools::Read(shp, brepPath.c_str(), b)) {
+                result->shapesByKey[node->shapeKey] = shp;
+                ++n;
+            }
+        }
+        MF_INFO("BRep cache loaded: {} parts, {} shapes", result->partsById.size(), n);
+        return n > 0;
+    } catch (...) {
+        MF_WARN("BRep cache load failed, falling back to STEP parse");
+        return false;
+    }
+}
+
+// ------------------------------------------------------------------
+// BRep binary cache: save assembly tree + shapes to disk
+// ------------------------------------------------------------------
+void STEPReader::Impl::saveToCache(const std::string& cacheDir) {
+    if (!result) return;
+    try {
+        std::filesystem::create_directories(cacheDir);
+        std::string shapesDir = cacheDir + "/shapes";
+        std::filesystem::create_directories(shapesDir);
+
+        // Assembly tree JSON
+        nlohmann::json j;
+        j["entityCount"] = result->entityCount;
+        j["fileScale"] = result->fileScale;
+
+        std::vector<std::string> rc;
+        for (auto& c : result->root->children) rc.push_back(c->id);
+        j["rootChildren"] = rc;
+
+        nlohmann::json pj;
+        for (auto& [pid, node] : result->partsById) {
+            nlohmann::json n;
+            n["id"] = node->id;
+            n["name"] = node->name;
+            n["type"] = static_cast<int>(node->type);
+            n["shapeKey"] = node->shapeKey;
+            n["isInstance"] = node->isInstance;
+            n["prototypeId"] = node->prototypeId;
+            if (node->parent && node->parent->type != AssemblyNode::Type::Root)
+                n["parentId"] = node->parent->id;
+            std::vector<float> tf(16);
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    tf[r * 4 + c] = node->localTransform[c][r];
+            n["transform"] = tf;
+            pj[pid] = n;
+        }
+        j["parts"] = pj;
+
+        nlohmann::json ij;
+        for (auto& [protoId, nodes] : result->instances) {
+            std::vector<std::string> ids;
+            for (auto& nd : nodes) ids.push_back(nd->id);
+            ij[protoId] = ids;
+        }
+        j["instances"] = ij;
+
+        std::ofstream jout(cacheDir + "/assembly.json");
+        jout << j.dump(2);
+
+        // Shapes as BRep binary
+        size_t ns = 0;
+        for (auto& [key, shape] : result->shapesByKey) {
+            if (BRepTools::Write(shape, (shapesDir + "/" + key + ".brep").c_str()))
+                ++ns;
+        }
+        MF_INFO("BRep cache saved: {} shapes to {}", ns, cacheDir);
+    } catch (...) {
+        MF_WARN("BRep cache save failed");
     }
 }
 

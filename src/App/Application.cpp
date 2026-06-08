@@ -10,6 +10,7 @@
 #include <imgui_impl_opengl3.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
+#include <chrono>
 #include <filesystem>
 #include <cctype>
 #include <cstdlib>
@@ -307,43 +308,50 @@ void Application::runFrame() {
         }
     }
 
-    // Sync viewport highlight with scene tree selection
+    // Sync viewport highlight with scene tree selection.
+    // Always clear face ranges when in Part mode — they're only for MeshFace mode.
     auto selectedNodes = m_ui.selectedNodes();
-    std::unordered_set<EntityId> currSelection;
-    for (auto& n : selectedNodes) currSelection.insert(n->id());
-    if (currSelection != m_prevSelection) {
-        m_prevSelection = currSelection;
-        // Compute union of index ranges for all selected nodes
-        uint32_t hOffset = 0, hCount = 0;
-        bool first = true;
-        for (auto& node : selectedNodes) {
-            if (!node->mesh()) continue;
-            std::string key = node->mesh()->name;
-            // Find the part ID that corresponds to this shape key
-            for (auto& [pid, part] : m_stepResult->partsById) {
-                if (part->shapeKey == key) {
-                    auto it = m_partIndexRanges.find(pid);
-                    if (it != m_partIndexRanges.end()) {
-                        if (first) {
-                            hOffset = it->second.first;
-                            hCount = it->second.second;
-                            first = false;
-                        } else {
-                            // Extend range (assumes contiguous layout)
-                            uint32_t end = std::max(hOffset + hCount, it->second.first + it->second.second);
-                            hOffset = std::min(hOffset, it->second.first);
-                            hCount = end - hOffset;
+    bool isMeshFaceMode = m_ui.viewportSelectionMode() == ViewportPanel::SelectionMode::MeshFace;
+
+    if (!isMeshFaceMode) {
+        // Part mode: compute highlight from selected scene tree nodes
+        std::unordered_set<EntityId> currSelection;
+        for (auto& n : selectedNodes) currSelection.insert(n->id());
+        if (currSelection != m_prevSelection) {
+            m_prevSelection = currSelection;
+            uint32_t hOffset = 0, hCount = 0;
+            bool first = true;
+            for (auto& node : selectedNodes) {
+                if (!node->mesh()) continue;
+                std::string key = node->mesh()->name;
+                for (auto& [pid, part] : m_stepResult->partsById) {
+                    if (part->shapeKey == key) {
+                        auto it = m_partIndexRanges.find(pid);
+                        if (it != m_partIndexRanges.end()) {
+                            if (first) {
+                                hOffset = it->second.first;
+                                hCount = it->second.second;
+                                first = false;
+                            } else {
+                                uint32_t end = std::max(hOffset + hCount, it->second.first + it->second.second);
+                                hOffset = std::min(hOffset, it->second.first);
+                                hCount = end - hOffset;
+                            }
                         }
+                        break;
                     }
-                    break;
                 }
             }
+            if (hCount > 0) {
+                m_ui.clearViewportFaceRanges();
+                m_ui.setHighlightForViewport(hOffset, hCount);
+            } else {
+                m_ui.clearViewportHighlight();
+            }
         }
-        if (hCount > 0) {
-            m_ui.setHighlightForViewport(hOffset, hCount);
-        } else {
-            m_ui.clearViewportHighlight();
-        }
+    } else {
+        // MeshFace mode: highlight comes from viewport's face ranges
+        m_prevSelection.clear();
     }
 
     // Stats — show viewport mesh triangles and CAD-aware pipeline info
@@ -362,141 +370,214 @@ void Application::runFrame() {
 
 void Application::loadSTEP(const std::string& filepath) {
     MF_INFO("Loading STEP: {}", filepath);
-    m_stepResult = m_stepReader.read(filepath);
-    if (m_stepResult && m_stepResult->root) {
+    auto t0 = std::chrono::steady_clock::now();
 
-        // --- CAD-aware pipeline ---
-        if (m_config.useCADAwarePipeline) {
-            MF_INFO("Using CAD-aware pipeline...");
+    // Compute cache dir from file hash for BRep binary cache
+    std::hash<std::string> hasher;
+    std::string brepCacheDir = m_config.cacheDir + "/brep_" + std::to_string(hasher(filepath));
 
-            // Step 1: BRep Analysis
-            m_shapeAnalyses = m_brepAnalyzer.analyzeBatch(m_stepResult->shapesByKey);
+    m_stepResult = m_stepReader.read(filepath, brepCacheDir);
+    if (!m_stepResult || !m_stepResult->root) {
+        MF_ERROR("Import failed: could not parse STEP file");
+        return;
+    }
 
-            // Step 2: Surface Classification
-            m_classifications = m_surfaceClassifier.classifyBatch(m_shapeAnalyses);
+    auto t1 = std::chrono::steady_clock::now();
+    MF_INFO("STEP parse: {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
-            // Step 3: Adaptive Tessellation
-            m_taggedMeshes.clear();
-            m_partMeshes.clear();
-            m_partSimplifyStates.clear();
+    m_partMeshes.clear();
+    m_partSimplifyStates.clear();
+    m_taggedMeshes.clear();
 
-            for (auto& [shapeKey, shape] : m_stepResult->shapesByKey) {
-                auto classIt = m_classifications.find(shapeKey);
-                if (classIt == m_classifications.end()) continue;
+    // Collect shapes into a contiguous vector for parallel processing
+    std::vector<std::pair<std::string, TopoDS_Shape>> shapes;
+    shapes.reserve(m_stepResult->shapesByKey.size());
+    for (auto& [key, shp] : m_stepResult->shapesByKey) {
+        shapes.emplace_back(key, shp);
+    }
 
-                TaggedMesh taggedMesh = m_adaptiveTessellator.tessellate(
-                    shape, classIt->second, m_config.adaptiveTessellation);
+    if (m_config.useCADAwarePipeline) {
+        // --- CAD-aware: sequential analysis + parallel tessellation ---
+        MF_INFO("Using CAD-aware pipeline with {} shapes...", shapes.size());
 
-                if (!taggedMesh.mesh.vertices.empty()) {
-                    m_taggedMeshes[shapeKey] = taggedMesh;
+        m_shapeAnalyses = m_brepAnalyzer.analyzeBatch(m_stepResult->shapesByKey);
+        m_classifications = m_surfaceClassifier.classifyBatch(m_shapeAnalyses);
 
-                    auto lodMesh = std::make_shared<LODMesh>();
-                    lodMesh->name = shapeKey;
-                    LODLevel level;
-                    level.level = 0;
-                    level.screenSize = 0.0f;
-                    level.mesh = taggedMesh.mesh;
-                    level.mesh.computeAABB();
+        auto t2 = std::chrono::steady_clock::now();
+        MF_INFO("Analysis+Classification: {} ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
 
-                    PartSimplifyState state;
-                    state.originalMesh = level.mesh;
-                    state.isSimplified = false;
-                    m_partSimplifyStates[shapeKey] = std::move(state);
+        // Pre-allocate storage for each shape (needed for thread safety)
+        std::vector<TaggedMesh> taggedResults(shapes.size());
+        std::vector<bool> shapeValid(shapes.size(), false);
+        m_partSimplifyStates.reserve(shapes.size());
 
-                    lodMesh->lods.push_back(std::move(level));
-                    m_partMeshes[shapeKey] = lodMesh;
+        // Parallel tessellation with TBB
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, shapes.size()),
+            [&](const tbb::blocked_range<size_t>& r) {
+                AdaptiveTessellator localTess;
+                for (size_t i = r.begin(); i != r.end(); ++i) {
+                    auto& [key, shape] = shapes[i];
+                    auto classIt = m_classifications.find(key);
+                    if (classIt == m_classifications.end()) continue;
+
+                    TaggedMesh tm = localTess.tessellate(
+                        shape, classIt->second, m_config.adaptiveTessellation);
+                    if (!tm.mesh.vertices.empty()) {
+                        tm.mesh.computeAABB();
+                        taggedResults[i] = std::move(tm);
+                        shapeValid[i] = true;
+                    }
                 }
-            }
+            });
 
-            // Step 4: Shell Extraction (Voxel Voting)
-            // Build world-space inputs for visibility analysis
+        // Single-threaded merge of results
+        for (size_t i = 0; i < shapes.size(); ++i) {
+            if (!shapeValid[i]) continue;
+            auto& [key, shape] = shapes[i];
+
+            m_taggedMeshes[key] = taggedResults[i];
+
+            auto lodMesh = std::make_shared<LODMesh>();
+            lodMesh->name = key;
+            LODLevel level;
+            level.level = 0;
+            level.screenSize = 0.0f;
+            level.mesh = taggedResults[i].mesh;
+            level.mesh.computeAABB();
+
+            PartSimplifyState state;
+            state.originalMesh = level.mesh;
+            state.isSimplified = false;
+            m_partSimplifyStates[key] = std::move(state);
+
+            lodMesh->lods.push_back(std::move(level));
+            m_partMeshes[key] = lodMesh;
+        }
+
+        auto t3 = std::chrono::steady_clock::now();
+        MF_INFO("Tessellation: {} ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count());
+
+        // Shell extraction (only if not fast import)
+        if (!m_config.useFastImport) {
             std::vector<ShellShapeInput> shellInputs;
             for (auto& [id, part] : m_stepResult->partsById) {
                 auto it = m_partMeshes.find(part->shapeKey);
                 if (it == m_partMeshes.end()) continue;
-
                 Mat4 world(1.0f);
                 auto p = part;
                 while (p && p->type != AssemblyNode::Type::Root) {
                     world = p->localTransform * world;
                     p = p->parent;
                 }
-
                 ShellShapeInput input;
                 input.shapeKey = id;
                 input.worldTransform = world;
-
-                // Transform mesh to world space
-                const auto& localMesh = it->second->lods[0].mesh;
-                input.mesh.vertices.reserve(localMesh.vertices.size());
-                for (const auto& v : localMesh.vertices) {
+                const auto& lm = it->second->lods[0].mesh;
+                input.mesh.vertices.reserve(lm.vertices.size());
+                for (const auto& v : lm.vertices) {
                     Vertex wv = v;
                     wv.position = Vec3(world * Vec4(v.position, 1.0f));
                     wv.normal = glm::normalize(Vec3(world * Vec4(v.normal, 0.0f)));
                     input.mesh.vertices.push_back(wv);
                 }
-                input.mesh.indices = localMesh.indices;
-
+                input.mesh.indices = lm.indices;
                 shellInputs.push_back(std::move(input));
             }
-
             m_shellResult = m_shellExtractor.extract(shellInputs, m_config.shellExtraction);
+            auto t4 = std::chrono::steady_clock::now();
+            MF_INFO("Shell extraction: {} ms",
+                    std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count());
+        }
+    } else {
+        // --- Fast uniform tessellation (parallel, with disk cache) ---
+        MF_INFO("Fast uniform tessellation for {} shapes...", shapes.size());
 
-            MF_INFO("CAD-aware pipeline complete: {} shapes analyzed, {} classified, {} extracted",
-                    m_shapeAnalyses.size(), m_classifications.size(), m_shellResult.totalTrianglesAfter);
+        // Compute cache directory from file hash
+        std::hash<std::string> hasher;
+        std::string cacheDir = m_config.cacheDir + "/" + std::to_string(hasher(filepath));
+        std::filesystem::create_directories(cacheDir);
 
-        } else {
-            // --- Legacy uniform tessellation ---
-            BRepEngine engine;
-            TessellationParams params = m_config.tessellation;
-            m_partMeshes.clear();
-            m_partSimplifyStates.clear();
-            for (auto& [shapeKey, shape] : m_stepResult->shapesByKey) {
-                BRepMesh brepMesh = engine.tessellate(shape, params);
-                if (!brepMesh.vertices.empty()) {
-                    auto lodMesh = std::make_shared<LODMesh>();
-                    lodMesh->name = shapeKey;
-                    LODLevel level;
-                    level.level = 0;
-                    level.screenSize = 0.0f;
-                    level.mesh.vertices = std::move(brepMesh.vertices);
-                    level.mesh.indices = std::move(brepMesh.indices);
-                    level.mesh.computeAABB();
+        std::vector<MeshData> meshResults(shapes.size());
+        std::vector<bool> shapeValid(shapes.size(), false);
+        m_partSimplifyStates.reserve(shapes.size());
 
-                    PartSimplifyState state;
-                    state.originalMesh = level.mesh;
-                    state.isSimplified = false;
-                    m_partSimplifyStates[shapeKey] = std::move(state);
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, shapes.size()),
+            [&](const tbb::blocked_range<size_t>& r) {
+                BRepEngine localEngine;
+                TessellationParams localParams = m_config.tessellation;
+                for (size_t i = r.begin(); i != r.end(); ++i) {
+                    auto& [key, shape] = shapes[i];
+                    std::string cachePath = cacheDir + "/" + key + ".mesh";
 
-                    lodMesh->lods.push_back(std::move(level));
-                    m_partMeshes[shapeKey] = lodMesh;
+                    // Try cache first
+                    MeshData md;
+                    if (md.loadFromFile(cachePath)) {
+                        meshResults[i] = std::move(md);
+                        shapeValid[i] = true;
+                        continue;
+                    }
+
+                    // Tessellate + save to cache
+                    try {
+                        BRepMesh brepMesh = localEngine.tessellate(shape, localParams);
+                        if (!brepMesh.vertices.empty()) {
+                            md.vertices = std::move(brepMesh.vertices);
+                            md.indices = std::move(brepMesh.indices);
+                            md.computeAABB();
+                            md.saveToFile(cachePath);
+                            meshResults[i] = std::move(md);
+                            shapeValid[i] = true;
+                        }
+                    } catch (...) {
+                        MF_WARN("Tessellation failed for shape: {}", key);
+                    }
                 }
-            }
+            });
+
+        // Merge results (single-threaded, fast)
+        for (size_t i = 0; i < shapes.size(); ++i) {
+            if (!shapeValid[i]) continue;
+            auto& [key, shape] = shapes[i];
+
+            auto lodMesh = std::make_shared<LODMesh>();
+            lodMesh->name = key;
+            LODLevel level;
+            level.level = 0;
+            level.screenSize = 0.0f;
+            level.mesh = meshResults[i];
+            level.mesh.computeAABB();
+
+            PartSimplifyState state;
+            state.originalMesh = level.mesh;
+            state.isSimplified = false;
+            m_partSimplifyStates[key] = std::move(state);
+
+            lodMesh->lods.push_back(std::move(level));
+            m_partMeshes[key] = lodMesh;
         }
 
-        buildSceneFromSTEP();
-        m_ui.setScene(m_scene);
-
-        // rebuildViewportMesh merges all parts, records index ranges,
-        // and populates pick parts for viewport selection.
-        rebuildViewportMesh();
-
-        MF_INFO("Viewport mesh: {} verts, {} tris, aabb center ({:.2f},{:.2f},{:.2f}) diag={:.2f}",
-                m_viewportMesh.vertexCount(),
-                m_viewportMesh.triangleCount(),
-                m_viewportMesh.aabb.center().x,
-                m_viewportMesh.aabb.center().y,
-                m_viewportMesh.aabb.center().z,
-                m_viewportMesh.aabb.diagonal());
-
-        size_t pos = filepath.find_last_of("/\\");
-        std::string filename = (pos != std::string::npos) ? filepath.substr(pos + 1) : filepath;
-        std::string title = "MeshForge - " + filename;
-        SDL_SetWindowTitle(m_window, title.c_str());
-        MF_INFO("Import successful: {} parts", m_stepResult->partsById.size());
-    } else {
-        MF_ERROR("Import failed: could not parse STEP file");
+        auto t2 = std::chrono::steady_clock::now();
+        MF_INFO("Tessellation: {} ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
     }
+
+    // Build scene tree and viewport mesh ONCE after tessellation is complete
+    buildSceneFromSTEP();
+    m_ui.setScene(m_scene);
+    rebuildViewportMesh();
+
+    auto tEnd = std::chrono::steady_clock::now();
+    MF_INFO("Total import: {} ms, {} parts, {} verts, {} tris",
+            std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - t0).count(),
+            m_stepResult->partsById.size(),
+            m_viewportMesh.vertexCount(), m_viewportMesh.triangleCount());
+
+    size_t pos = filepath.find_last_of("/\\");
+    std::string filename = (pos != std::string::npos) ? filepath.substr(pos + 1) : filepath;
+    SDL_SetWindowTitle(m_window, ("MeshForge - " + filename).c_str());
+    MF_INFO("Import successful: {} parts", m_stepResult->partsById.size());
 }
 
 void Application::buildSceneFromSTEP() {
@@ -782,7 +863,6 @@ void Application::rebuildViewportMesh() {
         auto meshIt = m_partMeshes.find(part->shapeKey);
         if (meshIt == m_partMeshes.end()) continue;
 
-        // Compute world transform
         Mat4 world(1.0f);
         auto p = part;
         while (p && p->type != AssemblyNode::Type::Root) {
@@ -790,14 +870,14 @@ void Application::rebuildViewportMesh() {
             p = p->parent;
         }
 
-        // Use simplified mesh if available, otherwise original
         const MeshData* localMesh = nullptr;
         auto stateIt = m_partSimplifyStates.find(part->shapeKey);
-        if (stateIt != m_partSimplifyStates.end() && stateIt->second.isSimplified) {
+        if (stateIt != m_partSimplifyStates.end() && stateIt->second.isSimplified)
             localMesh = &stateIt->second.simplifiedMesh;
-        } else {
+        else
             localMesh = &meshIt->second->lods[0].mesh;
-        }
+
+        if (localMesh->vertexCount() == 0) continue;
 
         uint32_t vertOffset = static_cast<uint32_t>(m_viewportMesh.vertices.size());
         uint32_t idxOffset  = static_cast<uint32_t>(m_viewportMesh.indices.size());
@@ -806,6 +886,8 @@ void Application::rebuildViewportMesh() {
             Vertex wv = v;
             wv.position = Vec3(world * Vec4(v.position, 1.0f));
             wv.normal = glm::normalize(Vec3(world * Vec4(v.normal, 0.0f)));
+            wv.uv = v.uv;
+            wv.tangent = v.tangent;
             m_viewportMesh.vertices.push_back(wv);
         }
         for (auto idx : localMesh->indices) {
@@ -820,31 +902,25 @@ void Application::rebuildViewportMesh() {
         m_viewportMesh.computeAABB();
         m_ui.setMeshForViewport(&m_viewportMesh);
 
-        // Build per-part pick info for viewport selection
+        uint32_t totalVerts = m_viewportMesh.vertexCount();
+        uint32_t totalIndices = m_viewportMesh.indexCount();
+
         std::vector<ViewportPanel::PartPickInfo> pickParts;
         for (auto& [pid, range] : m_partIndexRanges) {
-            AABB partAABB;
-            for (uint32_t i = range.first; i < range.first + range.second && i < m_viewportMesh.indices.size(); ++i) {
+            AABB aabb;
+            for (uint32_t i = range.first; i < range.first + range.second && i < totalIndices; ++i) {
                 uint32_t vi = m_viewportMesh.indices[i];
-                if (vi < m_viewportMesh.vertexCount())
-                    partAABB.expand(m_viewportMesh.vertices[vi].position);
+                if (vi < totalVerts) aabb.expand(m_viewportMesh.vertices[vi].position);
             }
-            ViewportPanel::PartPickInfo info;
-            info.indexOffset = range.first;
-            info.indexCount = range.second;
-            info.worldAABB = partAABB;
-
-            // Use direct partId -> sceneNodeId mapping built in buildSceneFromSTEP
-            auto nidIt = m_partNodeIds.find(pid);
-            if (nidIt != m_partNodeIds.end()) {
-                info.sceneNodeId = nidIt->second;
-            }
-
+            ViewportPanel::PartPickInfo pi;
+            pi.indexOffset = range.first;
+            pi.indexCount = range.second;
+            pi.worldAABB = aabb;
+            auto nit = m_partNodeIds.find(pid);
+            if (nit != m_partNodeIds.end()) pi.sceneNodeId = nit->second;
             auto pit = m_stepResult->partsById.find(pid);
-            if (pit != m_stepResult->partsById.end()) {
-                info.meshName = pit->second->shapeKey;
-            }
-            pickParts.push_back(std::move(info));
+            if (pit != m_stepResult->partsById.end()) pi.meshName = pit->second->shapeKey;
+            pickParts.push_back(std::move(pi));
         }
         m_ui.setViewportPickParts(pickParts);
     }

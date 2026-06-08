@@ -24,6 +24,10 @@ struct MeshData {
     void computeAABB();
     void computeNormals();
     void computeTangents();
+
+    // Binary cache I/O
+    bool saveToFile(const std::string& path) const;
+    bool loadFromFile(const std::string& path);
 };
 
 // ------------------------------------------------------------------

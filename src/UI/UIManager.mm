@@ -340,11 +340,22 @@ void ViewportPanel::setHighlightRange(uint32_t indexOffset, uint32_t indexCount)
     m_highlightIndexOffset = indexOffset;
     m_highlightIndexCount = indexCount;
     m_hasHighlight = (indexCount > 0);
+    m_selectedFaceRanges.clear();  // part mode clears face ranges
+}
+
+void ViewportPanel::setHighlightRanges(const std::vector<std::pair<uint32_t,uint32_t>>& ranges) {
+    m_selectedFaceRanges = ranges;
+    m_hasHighlight = !ranges.empty();
+    if (!ranges.empty()) {
+        m_highlightIndexOffset = ranges[0].first;
+        m_highlightIndexCount = ranges[0].second;
+    }
 }
 
 void ViewportPanel::clearHighlight() {
     m_hasHighlight = false;
     m_highlightIndexCount = 0;
+    m_selectedFaceRanges.clear();
 }
 
 void ViewportPanel::setPickParts(const std::vector<PartPickInfo>& parts) {
@@ -469,25 +480,26 @@ void ViewportPanel::doBoxPick(float x0, float y0, float x1, float y1) {
     Mat4 viewMat = glm::lookAt(eye, m_target, Vec3(0, 1, 0));
     Mat4 vp = proj * viewMat;
 
-    auto projectToScreen = [&](const Vec3& worldPt) -> std::pair<float, float> {
+    // NDC→screen, returns false for vertices behind camera (clip.w <= 0)
+    auto projectToScreen = [&](const Vec3& worldPt, float& sx, float& sy) -> bool {
         Vec4 clip = vp * Vec4(worldPt, 1.0f);
-        if (std::abs(clip.w) < 1e-8f) return { -9999.f, -9999.f };
+        if (clip.w <= 1e-6f) return false; // behind or at camera plane → skip
         float ndcX = clip.x / clip.w;
         float ndcY = clip.y / clip.w;
-        float screenX = (ndcX * 0.5f + 0.5f) * w;
-        float screenY = (1.0f - (ndcY * 0.5f + 0.5f)) * h;
-        return { screenX, screenY };
+        sx = (ndcX * 0.5f + 0.5f) * w;
+        sy = (1.0f - (ndcY * 0.5f + 0.5f)) * h;
+        return true;
     };
 
     std::vector<EntityId> selected;
     for (const auto& part : m_pickParts) {
         if (part.worldAABB.isEmpty()) continue;
 
-        // Project all 8 corners of the world AABB to screen space
         float pminX = std::numeric_limits<float>::max();
         float pmaxX = -std::numeric_limits<float>::max();
         float pminY = std::numeric_limits<float>::max();
         float pmaxY = -std::numeric_limits<float>::max();
+        int visibleCorners = 0;
 
         for (int ci = 0; ci < 8; ++ci) {
             Vec3 corner(
@@ -495,18 +507,76 @@ void ViewportPanel::doBoxPick(float x0, float y0, float x1, float y1) {
                 (ci & 2) ? part.worldAABB.max.y : part.worldAABB.min.y,
                 (ci & 4) ? part.worldAABB.max.z : part.worldAABB.min.z
             );
-            auto [sx, sy] = projectToScreen(corner);
-            pminX = std::min(pminX, sx);
-            pmaxX = std::max(pmaxX, sx);
-            pminY = std::min(pminY, sy);
-            pmaxY = std::max(pmaxY, sy);
+            float sx, sy;
+            if (projectToScreen(corner, sx, sy)) {
+                pminX = std::min(pminX, sx);
+                pmaxX = std::max(pmaxX, sx);
+                pminY = std::min(pminY, sy);
+                pmaxY = std::max(pmaxY, sy);
+                ++visibleCorners;
+            }
         }
 
-        // Touch semantics: any overlap = selected
+        if (visibleCorners > 0 && visibleCorners < 8) {
+            pminX = std::max(pminX, 0.0f);
+            pmaxX = std::min(pmaxX, static_cast<float>(w));
+            pminY = std::max(pminY, 0.0f);
+            pmaxY = std::min(pmaxY, static_cast<float>(h));
+        }
+        if (visibleCorners == 0) continue;
+
         if (pmaxX >= selMinX && pminX <= selMaxX &&
             pmaxY >= selMinY && pminY <= selMaxY) {
-            if (part.sceneNodeId != 0)
-                selected.push_back(part.sceneNodeId);
+            if (m_selMode == SelectionMode::Part) {
+                if (part.sceneNodeId != 0)
+                    selected.push_back(part.sceneNodeId);
+            } else {
+                // MeshFace mode: split the part into triangle batches,
+                // test each batch against the selection rectangle.
+                const uint32_t kBatchTris = 200;  // triangles per batch
+                uint32_t partTriStart = part.indexOffset;
+                uint32_t partTriCount = part.indexCount;
+                uint32_t numBatches = (partTriCount / 3 + kBatchTris - 1) / kBatchTris;
+
+                for (uint32_t bi = 0; bi < numBatches; ++bi) {
+                    uint32_t batchStartTri = partTriStart + bi * kBatchTris * 3;
+                    uint32_t batchTriCount = std::min(kBatchTris, (partTriCount / 3) - bi * kBatchTris);
+                    if (batchTriCount == 0) break;
+                    uint32_t batchIdxStart = batchStartTri;
+                    uint32_t batchIdxCount = batchTriCount * 3;
+
+                    // Project the batch's vertex positions to screen space
+                    float bMinX = std::numeric_limits<float>::max();
+                    float bMaxX = -std::numeric_limits<float>::max();
+                    float bMinY = std::numeric_limits<float>::max();
+                    float bMaxY = -std::numeric_limits<float>::max();
+                    int bVisible = 0;
+
+                    for (uint32_t ti = 0; ti < batchTriCount; ++ti) {
+                        uint32_t ii = batchStartTri + ti * 3;
+                        if (ii + 2 >= m_mesh->indices.size()) break;
+                        for (int vi = 0; vi < 3; ++vi) {
+                            uint32_t idx = m_mesh->indices[ii + vi];
+                            if (idx < m_mesh->vertexCount()) {
+                                float sx, sy;
+                                if (projectToScreen(m_mesh->vertices[idx].position, sx, sy)) {
+                                    bMinX = std::min(bMinX, sx);
+                                    bMaxX = std::max(bMaxX, sx);
+                                    bMinY = std::min(bMinY, sy);
+                                    bMaxY = std::max(bMaxY, sy);
+                                    ++bVisible;
+                                }
+                            }
+                        }
+                    }
+
+                    if (bVisible > 0 &&
+                        bMaxX >= selMinX && bMinX <= selMaxX &&
+                        bMaxY >= selMinY && bMinY <= selMaxY) {
+                        m_selectedFaceRanges.push_back({batchIdxStart, batchIdxCount});
+                    }
+                }
+            }
         }
     }
 
@@ -609,17 +679,23 @@ void ViewportPanel::render3D() {
         glUniform1f(scaleLoc, 0.0f); // no offset
         glDrawElements(GL_TRIANGLES, m_gpuIndexCount, GL_UNSIGNED_INT, 0);
 
-        // Pass 2: highlight — bright filled overlay drawn slightly in front
-        if (m_hasHighlight && m_highlightIndexCount > 0) {
-            // Push highlighted geometry slightly forward to avoid z-fighting
+        // Pass 2: highlight — bright filled overlay for selected parts / face ranges
+        if (m_hasHighlight || !m_selectedFaceRanges.empty()) {
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(-2.0f, -4.0f);
-
-            // Draw highlighted triangles in bright orange-yellow fill
-            glUniform3f(tintLoc, 1.0f, 0.65f, 0.0f); // bright orange
+            glUniform3f(tintLoc, 1.0f, 0.65f, 0.0f);
             glUniform1f(scaleLoc, 0.0f);
-            glDrawElements(GL_TRIANGLES, m_highlightIndexCount, GL_UNSIGNED_INT,
-                           reinterpret_cast<void*>(static_cast<uintptr_t>(m_highlightIndexOffset * sizeof(Index))));
+
+            if (!m_selectedFaceRanges.empty()) {
+                for (auto& [off, cnt] : m_selectedFaceRanges) {
+                    if (cnt > 0)
+                        glDrawElements(GL_TRIANGLES, cnt, GL_UNSIGNED_INT,
+                                       reinterpret_cast<void*>(static_cast<uintptr_t>(off * sizeof(Index))));
+                }
+            } else if (m_hasHighlight && m_highlightIndexCount > 0) {
+                glDrawElements(GL_TRIANGLES, m_highlightIndexCount, GL_UNSIGNED_INT,
+                               reinterpret_cast<void*>(static_cast<uintptr_t>(m_highlightIndexOffset * sizeof(Index))));
+            }
 
             glDisable(GL_POLYGON_OFFSET_FILL);
         }
@@ -654,6 +730,14 @@ void ViewportPanel::draw() {
     if (ImGui::Button("Focus")) focusOnObject();
     ImGui::SameLine();
     if (ImGui::Button("Refresh")) refresh();
+    ImGui::SameLine();
+    // Selection mode toggle
+    const char* selModes[] = {"Part", "Mesh Face"};
+    int selIdx = (m_selMode == SelectionMode::Part) ? 0 : 1;
+    ImGui::SetNextItemWidth(100);
+    if (ImGui::Combo("##selmode", &selIdx, selModes, 2)) {
+        m_selMode = (selIdx == 0) ? SelectionMode::Part : SelectionMode::MeshFace;
+    }
     ImGui::SameLine();
     if (m_mesh && m_mesh->triangleCount() > 0) {
         ImGui::Text("Tris: %u | Verts: %u", m_mesh->triangleCount(), m_mesh->vertexCount());
@@ -959,6 +1043,14 @@ void UIManager::setHighlightForViewport(uint32_t offset, uint32_t count) {
 
 void UIManager::clearViewportHighlight() {
     if (m_viewport) m_viewport->clearHighlight();
+}
+
+void UIManager::clearViewportFaceRanges() {
+    if (m_viewport) m_viewport->clearSelectedFaces();
+}
+
+ViewportPanel::SelectionMode UIManager::viewportSelectionMode() const {
+    return m_viewport ? m_viewport->selectionMode() : ViewportPanel::SelectionMode::Part;
 }
 
 void UIManager::refreshViewport() {

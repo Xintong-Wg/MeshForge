@@ -1,6 +1,9 @@
 #include "Mesh/MeshData.h"
+#include "Core/Logger.h"
 #include <glm/glm.hpp>
 #include <unordered_map>
+#include <fstream>
+#include <cstring>
 
 namespace mf {
 
@@ -105,6 +108,42 @@ size_t MeshCacheKeyHash::operator()(const MeshCacheKey& k) const {
     size_t h2 = std::hash<float>{}(k.linearDeflection);
     size_t h3 = std::hash<float>{}(k.angularDeflection);
     return h1 ^ (h2 << 1) ^ (h3 << 2);
+}
+
+bool MeshData::saveToFile(const std::string& path) const {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+
+    uint32_t vc = vertexCount();
+    uint32_t ic = indexCount();
+    out.write(reinterpret_cast<const char*>(&vc), 4);
+    out.write(reinterpret_cast<const char*>(&ic), 4);
+    out.write(reinterpret_cast<const char*>(&aabb.min), sizeof(Vec3));
+    out.write(reinterpret_cast<const char*>(&aabb.max), sizeof(Vec3));
+    if (vc > 0)
+        out.write(reinterpret_cast<const char*>(vertices.data()), vc * sizeof(Vertex));
+    if (ic > 0)
+        out.write(reinterpret_cast<const char*>(indices.data()), ic * sizeof(Index));
+    return out.good();
+}
+
+bool MeshData::loadFromFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+
+    uint32_t vc = 0, ic = 0;
+    in.read(reinterpret_cast<char*>(&vc), 4);
+    in.read(reinterpret_cast<char*>(&ic), 4);
+    in.read(reinterpret_cast<char*>(&aabb.min), sizeof(Vec3));
+    in.read(reinterpret_cast<char*>(&aabb.max), sizeof(Vec3));
+
+    vertices.resize(vc);
+    indices.resize(ic);
+    if (vc > 0)
+        in.read(reinterpret_cast<char*>(vertices.data()), vc * sizeof(Vertex));
+    if (ic > 0)
+        in.read(reinterpret_cast<char*>(indices.data()), ic * sizeof(Index));
+    return in.good();
 }
 
 } // namespace mf
