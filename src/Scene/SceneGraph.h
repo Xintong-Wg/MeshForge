@@ -33,7 +33,8 @@ public:
     EntityId id() const { return m_id; }
 
     const Transform& localTransform() const { return m_local; }
-    void setLocalTransform(const Transform& t) { m_local = t; m_dirty = true; }
+    void setLocalTransform(const Transform& t);
+    void setLocalMatrix(const Mat4& m);
 
     Mat4 worldTransform() const;
     AABB worldAABB() const;
@@ -63,6 +64,8 @@ private:
     Type m_type;
     EntityId m_id;
     Transform m_local;
+    Mat4 m_localMatrix{1.0f};
+    bool m_useLocalMatrix = false;
     mutable Mat4 m_world{1.0f};
     mutable AABB m_worldAABB;
     mutable bool m_dirty = true;

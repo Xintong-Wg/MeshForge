@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <limits>
 #include <unordered_map>
 #include <cstdint>
+#include <limits>
 
 // Fast Quadric Mesh Simplification header-only
 #include "Simplify.h"
@@ -80,39 +82,64 @@ static size_t runMeshOptSimplifySloppy(
     );
 }
 
+static bool hasValidIndices(const MeshData& mesh) {
+    if (mesh.vertices.empty() || mesh.indices.empty()) return false;
+    if (mesh.indices.size() % 3 != 0) return false;
+    if (mesh.vertexCount() > 50'000'000u || mesh.indexCount() > 150'000'000u) return false;
+    uint32_t vertexCount = mesh.vertexCount();
+    for (Index idx : mesh.indices) {
+        if (idx >= vertexCount) return false;
+    }
+    return true;
+}
+
 // ------------------------------------------------------------------
-// Build output mesh from simplified indices + vertex fetch remap
+// Build output mesh from simplified indices.
+// Only keeps vertices that are actually referenced by the output indices.
 // ------------------------------------------------------------------
 static MeshData buildOutputMesh(const MeshData& input, std::vector<unsigned int>& indices, size_t indexCount)
 {
-    indices.resize(indexCount);
+    if (indexCount == 0 || indexCount > indices.size() || indexCount % 3 != 0) {
+        MF_WARN("Simplifier returned invalid index count {}; falling back to original mesh", indexCount);
+        return input;
+    }
 
+    if (input.vertices.empty() || input.indices.empty()) {
+        return input;
+    }
+
+    // Copy the simplified index subset and remap vertices to only those used.
     MeshData out;
-    out.indices.resize(indices.size());
-    for (size_t i = 0; i < indices.size(); ++i) {
+    out.indices.resize(indexCount);
+    for (size_t i = 0; i < indexCount; ++i) {
+        if (indices[i] >= input.vertexCount()) {
+            MF_WARN("Simplifier produced invalid vertex index {}, falling back to original mesh", indices[i]);
+            return input;
+        }
         out.indices[i] = static_cast<Index>(indices[i]);
     }
 
-    // Vertex fetch optimization: remap to only used vertices
-    std::vector<unsigned int> remap(input.vertexCount());
-    size_t unique = meshopt_optimizeVertexFetchRemap(
-        remap.data(), out.indices.data(), out.indices.size(), input.vertexCount()
-    );
-
-    out.vertices.resize(unique);
-    for (size_t i = 0; i < out.indices.size(); ++i) {
-        out.indices[i] = static_cast<Index>(remap[out.indices[i]]);
-    }
-    for (size_t i = 0; i < unique; ++i) {
-        out.vertices[i] = input.vertices[remap[i]];
+    // Remap vertices so only referenced vertices are kept.
+    std::vector<unsigned int> remap(input.vertexCount(), static_cast<unsigned int>(-1));
+    uint32_t next = 0;
+    for (size_t i = 0; i < indexCount; ++i) {
+        unsigned int src = out.indices[i];
+        if (remap[src] == static_cast<unsigned int>(-1)) {
+            remap[src] = next++;
+        }
+        out.indices[i] = static_cast<Index>(remap[src]);
     }
 
-    // Optimize vertex cache and overdraw
-    meshopt_optimizeVertexCache(out.indices.data(), out.indices.data(), out.indices.size(), unique);
-    meshopt_optimizeOverdraw(out.indices.data(), out.indices.data(), out.indices.size(),
-                             reinterpret_cast<const float*>(out.vertices.data()), unique, sizeof(Vertex), 1.05f);
+    out.vertices.resize(next);
+    for (size_t i = 0; i < input.vertexCount(); ++i) {
+        if (remap[i] != static_cast<unsigned int>(-1)) {
+            out.vertices[remap[i]] = input.vertices[i];
+        }
+    }
 
-    out.computeAABB();
+    if (!out.vertices.empty()) {
+        out.computeAABB();
+    }
     return out;
 }
 
@@ -126,13 +153,22 @@ static MeshData buildOutputMesh(const MeshData& input, std::vector<unsigned int>
 // ------------------------------------------------------------------
 SimplifyResult Simplifier::simplifyMeshOptimizer(const MeshData& input, const SimplifyParams& params) {
     SimplifyResult result;
-    if (input.triangleCount() == 0) {
+    if (input.triangleCount() == 0 || !hasValidIndices(input)) {
+        if (input.triangleCount() != 0) {
+            MF_WARN("Simplifier input mesh has invalid indices; skipping simplification");
+        }
         result.mesh = input;
         result.achievedRatio = 1.0f;
         return result;
     }
 
     uint32_t sourceTris = input.triangleCount();
+    if (sourceTris <= 4) {
+        result.mesh = input;
+        result.achievedRatio = 1.0f;
+        return result;
+    }
+
     uint32_t targetTris = std::max(4u,
         static_cast<uint32_t>(static_cast<float>(sourceTris) * params.targetRatio));
     targetTris = std::min(targetTris, sourceTris - 1);
@@ -185,82 +221,84 @@ SimplifyResult Simplifier::simplifyMeshOptimizer(const MeshData& input, const Si
 
     // --- Cad bypass: weld seam vertices, then sloppy from original ---
     // CAD meshes have face-boundary attribute discontinuities that block
-    // attribute-aware simplify.  Weld close vertices (same position, average
-    // normals) then run sloppy which doesn't preserve seams.
+    // attribute-aware simplify.  Weld vertices at exactly the same position
+    // (averaging normals) then run sloppy which doesn't preserve seams.
     if (params.useSloppyFallback && bestTris > targetTris * 1.4f) {
         MF_INFO("  Normal simplify stalled at {:.1f}% (target {:.1f}%) — "
                 "welding CAD seams + sloppy simplify...",
                 static_cast<float>(bestTris) / static_cast<float>(sourceTris) * 100.0f,
                 params.targetRatio * 100.0f);
 
-        // Build a welded copy: merge vertices at the same position
         MeshData welded;
-        welded.vertices.reserve(input.vertices.size());
         welded.indices.reserve(input.indices.size());
 
-        // Spatial hash for position dedup
-        std::unordered_map<uint64_t, uint32_t> posMap;
-        constexpr float kHashScale = 1e3f;
+        // Build sorted position -> remap table using exact position comparison.
+        std::vector<std::pair<Vec3, uint32_t>> sorted;
+        sorted.reserve(input.vertices.size());
+        for (size_t i = 0; i < input.vertices.size(); ++i) {
+            sorted.emplace_back(input.vertices[i].position, static_cast<uint32_t>(i));
+        }
+        std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) {
+                if (a.first.x != b.first.x) return a.first.x < b.first.x;
+                if (a.first.y != b.first.y) return a.first.y < b.first.y;
+                return a.first.z < b.first.z;
+            });
 
-        for (const auto& v : input.vertices) {
-            // Quantize position to hash key
-            int64_t hx = static_cast<int64_t>(v.position.x * kHashScale);
-            int64_t hy = static_cast<int64_t>(v.position.y * kHashScale);
-            int64_t hz = static_cast<int64_t>(v.position.z * kHashScale);
-            uint64_t key = (static_cast<uint64_t>(hx) << 42)
-                         ^ (static_cast<uint64_t>(hy) << 21)
-                         ^ static_cast<uint64_t>(hz);
-
-            auto it = posMap.find(key);
-            if (it != posMap.end()) {
-                // Same approximate position — average the normal
-                welded.vertices[it->second].normal += v.normal;
+        std::vector<uint32_t> vertexRemap(input.vertices.size(), static_cast<uint32_t>(-1));
+        welded.vertices.reserve(input.vertices.size());
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            uint32_t srcIdx = sorted[i].second;
+            const Vec3& pos = sorted[i].first;
+            // Check if it matches the previous welded vertex (exact position)
+            if (i > 0 && pos == sorted[i - 1].first) {
+                uint32_t weldedIdx = vertexRemap[sorted[i - 1].second];
+                vertexRemap[srcIdx] = weldedIdx;
+                welded.vertices[weldedIdx].normal += input.vertices[srcIdx].normal;
             } else {
-                posMap[key] = static_cast<uint32_t>(welded.vertices.size());
-                welded.vertices.push_back(v);
+                uint32_t weldedIdx = static_cast<uint32_t>(welded.vertices.size());
+                vertexRemap[srcIdx] = weldedIdx;
+                welded.vertices.push_back(input.vertices[srcIdx]);
             }
         }
+
         for (auto& v : welded.vertices) {
-            v.normal = glm::normalize(v.normal);
+            float len = glm::length(v.normal);
+            v.normal = (len > 1e-10f) ? (v.normal / len) : Vec3(0, 1, 0);
         }
 
-        // Remap indices through the welded vertex map
         for (auto idx : input.indices) {
-            const auto& v = input.vertices[idx];
-            int64_t hx = static_cast<int64_t>(v.position.x * kHashScale);
-            int64_t hy = static_cast<int64_t>(v.position.y * kHashScale);
-            int64_t hz = static_cast<int64_t>(v.position.z * kHashScale);
-            uint64_t key = (static_cast<uint64_t>(hx) << 42)
-                         ^ (static_cast<uint64_t>(hy) << 21)
-                         ^ static_cast<uint64_t>(hz);
-            welded.indices.push_back(posMap[key]);
+            welded.indices.push_back(vertexRemap[idx]);
         }
 
-        MF_INFO("  Welded: {} verts -> {} verts ({} face seams merged)",
-                input.vertexCount(), welded.vertexCount(),
-                input.vertexCount() - welded.vertexCount());
+        if (!hasValidIndices(welded)) {
+            MF_WARN("  Welded mesh is invalid; skipping sloppy fallback");
+        } else {
+            MF_INFO("  Welded: {} verts -> {} verts ({} face seams merged)",
+                    input.vertexCount(), welded.vertexCount(),
+                    input.vertexCount() - welded.vertexCount());
 
-        // Run sloppy on the welded mesh — no attribute seams to block it
-        std::vector<unsigned int> sloppyIndices(welded.indices.begin(), welded.indices.end());
-        float sloppyError = 0.0f;
-        size_t sloppyCount = runMeshOptSimplifySloppy(
-            sloppyIndices, welded,
-            static_cast<size_t>(targetTris * 3),
-            &sloppyError
-        );
-        uint32_t sloppyTris = static_cast<uint32_t>(sloppyCount / 3);
-        MF_INFO("  Sloppy: {} -> {} tris (target {}, after welding)",
-                sourceTris, sloppyTris, targetTris);
+            std::vector<unsigned int> sloppyIndices(welded.indices.begin(), welded.indices.end());
+            float sloppyError = 0.0f;
+            size_t sloppyCount = runMeshOptSimplifySloppy(
+                sloppyIndices, welded,
+                static_cast<size_t>(targetTris * 3),
+                &sloppyError
+            );
+            uint32_t sloppyTris = static_cast<uint32_t>(sloppyCount / 3);
+            MF_INFO("  Sloppy: {} -> {} tris (target {}, after welding)",
+                    sourceTris, sloppyTris, targetTris);
 
-        if (sloppyCount > 0 && sloppyTris < bestTris) {
-            MeshData sloppyMesh = buildOutputMesh(welded, sloppyIndices, sloppyCount);
-            sloppyMesh.computeNormals(); // re-derive normals from simplified geometry
-            sloppyMesh.computeTangents();
-            result.mesh = std::move(sloppyMesh);
-            result.usedSloppy = true;
-            result.usedError = sloppyError;
-            bestTris = sloppyTris;
-            ++result.passes;
+            if (sloppyCount > 0 && sloppyTris < bestTris) {
+                MeshData sloppyMesh = buildOutputMesh(welded, sloppyIndices, sloppyCount);
+                sloppyMesh.computeNormals();
+                sloppyMesh.computeTangents();
+                result.mesh = std::move(sloppyMesh);
+                result.usedSloppy = true;
+                result.usedError = sloppyError;
+                bestTris = sloppyTris;
+                ++result.passes;
+            }
         }
     } else if (!params.useSloppyFallback && bestTris > targetTris * 1.4f) {
         MF_INFO("  Sloppy fallback disabled — achieved {:.1f}% vs target {:.1f}%",

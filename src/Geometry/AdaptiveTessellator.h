@@ -43,6 +43,7 @@ struct AdaptiveTessellationParams {
     // Global
     bool relativeToBBox = true;
     float minEdgeLength = 0.01f;
+    bool parallelMeshing = true;    // let OpenCASCADE parallelize inside one shape
 
     // If classification is not available, fall back to uniform tessellation
     bool useClassification = true;

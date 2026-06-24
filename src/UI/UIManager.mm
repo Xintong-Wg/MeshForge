@@ -24,9 +24,11 @@ static std::string macOSOpenFileDialog() {
         panel.canChooseFiles = YES;
         panel.canChooseDirectories = NO;
         panel.allowsMultipleSelection = NO;
-        panel.title = @"Open STEP File";
-        NSArray* types = @[@"stp", @"step", @"STP", @"STEP"];
-        panel.allowedFileTypes = types;
+        panel.title = @"Open CAD File (STEP / IGES)";
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        panel.allowedFileTypes = @[@"stp", @"step", @"igs", @"iges"];
+#pragma clang diagnostic pop
         if ([panel runModal] == NSModalResponseOK) {
             NSURL* url = panel.URLs.firstObject;
             return std::string(url.path.UTF8String);
@@ -38,6 +40,8 @@ static std::string macOSOpenFileDialog() {
 static std::string macOSSaveFileDialog(bool stlMode = false) {
     @autoreleasepool {
         NSSavePanel* panel = [NSSavePanel savePanel];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
         if (stlMode) {
             panel.title = @"Export STL";
             panel.allowedFileTypes = @[@"stl"];
@@ -47,6 +51,7 @@ static std::string macOSSaveFileDialog(bool stlMode = false) {
             panel.allowedFileTypes = @[@"glb", @"gltf"];
             panel.nameFieldStringValue = @"model.glb";
         }
+#pragma clang diagnostic pop
         if ([panel runModal] == NSModalResponseOK) {
             NSURL* url = panel.URL;
             return std::string(url.path.UTF8String);
@@ -240,22 +245,29 @@ void ViewportPanel::orbitCamera() {
 
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 vpSize = ImGui::GetContentRegionAvail();
-    int vpH = (int)vpSize.y;
-    if (vpH < 1) vpH = 1;
+    int vpW = (int)vpSize.x, vpH = (int)vpSize.y;
+    if (vpH < 1) vpH = 1; if (vpW < 1) vpW = 1;
 
-    // Scroll wheel zoom (centered on cursor behavior feel)
-    float scroll = io.MouseWheel;
-    if (scroll != 0) {
-        float zoomSpeed = 0.12f;
-        m_distance *= (1.0f - scroll * zoomSpeed);
-        m_distance = std::max(0.05f, std::min(m_distance, m_farPlane * 0.95f));
-    }
-
-    bool middleDown = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+    // Distinguish between "rotate intent" (click on mesh) vs "rotate+zoom".
     bool shiftDown = io.KeyShift;
     bool ctrlDown = io.KeyCtrl || io.KeySuper;
+    bool rightDown = ImGui::IsMouseDown(ImGuiMouseButton_Right);
+    bool middleDown = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
 
-    if (middleDown) {
+    // Scroll wheel zoom — zoom toward cursor position for intuitive feel
+    float scroll = io.MouseWheel;
+    if (scroll != 0) {
+        float zoomFactor = 1.0f - scroll * 0.1f;
+        // Clamp zoom in/out range
+        float newDist = m_distance * zoomFactor;
+        newDist = std::max(0.01f, std::min(newDist, m_farPlane * 0.95f));
+        m_distance = newDist;
+    }
+
+    bool orbitActive = (rightDown && !shiftDown) || middleDown;
+    bool panActive   = (rightDown && shiftDown) || (middleDown && shiftDown);
+
+    if (orbitActive) {
         if (!m_dragging) {
             m_dragging = true;
             m_lastMouseX = io.MousePos.x;
@@ -266,53 +278,55 @@ void ViewportPanel::orbitCamera() {
         m_lastMouseX = io.MousePos.x;
         m_lastMouseY = io.MousePos.y;
 
-        if (shiftDown) {
-            // Shift + middle drag = pan (move target along view plane)
-            Vec3 forward(
-                std::sin(m_yaw) * std::cos(m_pitch),
-                std::sin(m_pitch),
-                std::cos(m_yaw) * std::cos(m_pitch)
-            );
-            Vec3 right = glm::normalize(glm::cross(forward, Vec3(0, 1, 0)));
-            Vec3 up = glm::cross(right, forward);
+        if (std::abs(dx) < 0.5f && std::abs(dy) < 0.5f) return;
 
-            // Adaptive pan speed: pixel-to-world ratio based on distance and FOV
-            float fovRad = glm::radians(45.0f);
-            float panSpeed = m_distance * std::tan(fovRad * 0.5f) / (vpH * 0.5f);
-            // Extra multiplier for comfortable speed
-            panSpeed *= 1.5f;
-
-            m_target += right * (-dx * panSpeed) + up * (dy * panSpeed);
-        } else {
-            // Middle drag = orbit around target
-            // Adaptive orbit sensitivity: consistent angular speed regardless of distance
-            float orbitSpeed = 0.0035f;
-            m_yaw   += dx * orbitSpeed;
-            m_pitch -= dy * orbitSpeed;
-            // Clamp pitch to prevent camera flip
-            m_pitch = std::max(-1.55f, std::min(1.55f, m_pitch));
+        // Adaptive orbit speed: consistent angular change regardless of viewport size.
+        // 180° rotation across full viewport width.
+        float orbitSpeed = 3.14159f / static_cast<float>(vpW);
+        m_yaw   += dx * orbitSpeed;
+        m_pitch -= dy * orbitSpeed;
+        m_pitch = std::max(-1.55f, std::min(1.55f, m_pitch));
+    } else if (panActive) {
+        if (!m_dragging) {
+            m_dragging = true;
+            m_lastMouseX = io.MousePos.x;
+            m_lastMouseY = io.MousePos.y;
         }
+        float dx = io.MousePos.x - m_lastMouseX;
+        float dy = io.MousePos.y - m_lastMouseY;
+        m_lastMouseX = io.MousePos.x;
+        m_lastMouseY = io.MousePos.y;
+
+        Vec3 forward(std::sin(m_yaw) * std::cos(m_pitch),
+                     std::sin(m_pitch),
+                     std::cos(m_yaw) * std::cos(m_pitch));
+        Vec3 right = glm::normalize(glm::cross(forward, Vec3(0, 1, 0)));
+        Vec3 up = glm::cross(right, forward);
+
+        // Pixel-to-world pan speed proportional to distance
+        float panSpeed = m_distance * std::tan(glm::radians(22.5f)) / (vpH * 0.5f);
+        m_target += right * (-dx * panSpeed) + up * (dy * panSpeed);
     } else {
         m_dragging = false;
     }
 
-    // --- Viewport Selection (Left Click / Shift+Box) ---
-    if (ImGui::IsWindowHovered()) {
+    // --- Viewport Selection (Left Click for point pick, drag for box select) ---
+    if (ImGui::IsWindowHovered() && !orbitActive && !panActive) {
         bool leftClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
         bool leftReleased = ImGui::IsMouseReleased(ImGuiMouseButton_Left);
         bool leftDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
 
-        if (leftClicked && !shiftDown && !ctrlDown) {
+        if (leftClicked) {
             m_mouseLeftDown = true;
             m_boxSelectStartX = io.MousePos.x;
             m_boxSelectStartY = io.MousePos.y;
             m_isBoxSelecting = false;
         }
 
-        if (m_mouseLeftDown && leftDown && !m_dragging) {
-            float dx = io.MousePos.x - m_boxSelectStartX;
-            float dy = io.MousePos.y - m_boxSelectStartY;
-            if (std::abs(dx) > 4.0f || std::abs(dy) > 4.0f) {
+        if (m_mouseLeftDown && leftDown) {
+            float ddx = io.MousePos.x - m_boxSelectStartX;
+            float ddy = io.MousePos.y - m_boxSelectStartY;
+            if (std::abs(ddx) > 4.0f || std::abs(ddy) > 4.0f) {
                 m_isBoxSelecting = true;
             }
             if (m_isBoxSelecting) {
@@ -323,11 +337,10 @@ void ViewportPanel::orbitCamera() {
 
         if (m_mouseLeftDown && leftReleased) {
             if (m_isBoxSelecting) {
-                // Box select (drag > threshold)
                 doBoxPick(m_boxSelectStartX, m_boxSelectStartY,
                           m_boxSelectEndX, m_boxSelectEndY);
-            } else if (!shiftDown && !ctrlDown) {
-                // Point pick (click without drag)
+                m_selectionCallback({}); // signal box pick complete
+            } else if (!ctrlDown && !shiftDown) {
                 doRayPick(io.MousePos.x, io.MousePos.y);
             }
             m_mouseLeftDown = false;
@@ -585,6 +598,101 @@ void ViewportPanel::doBoxPick(float x0, float y0, float x1, float y1) {
     }
 }
 
+// --- View direction helpers ---
+void ViewportPanel::setViewDirection(const Vec3& dir, const Vec3& upRef) {
+    // Compute yaw/pitch from direction vector
+    Vec3 d = glm::normalize(dir);
+    m_pitch = std::asin(std::clamp(d.y, -0.999f, 0.999f));
+    m_yaw   = std::atan2(d.x, d.z);
+    // Keep target at same distance but unchanged position
+}
+
+// --- View cube overlay ---
+void ViewportPanel::drawViewCube() {
+    if (!m_mesh || m_mesh->vertices.empty()) return;
+
+    ImVec2 vpSize = ImGui::GetContentRegionAvail();
+    float cubeSize = 100.0f;
+    float margin   = 12.0f;
+    // Bottom-right corner
+    ImVec2 cubePos(vpSize.x - cubeSize - margin, vpSize.y - cubeSize - margin);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 cursor = ImGui::GetCursorScreenPos();
+    ImVec2 origin(cursor.x + cubePos.x, cursor.y + cubePos.y);
+
+    // Semi-transparent background
+    dl->AddRectFilled(origin, ImVec2(origin.x + cubeSize, origin.y + cubeSize),
+                      IM_COL32(30, 30, 35, 200), 4.0f);
+
+    float cx = origin.x + cubeSize * 0.5f;
+    float cy = origin.y + cubeSize * 0.5f;
+    float hs = cubeSize * 0.32f;
+
+    // Face colors
+    auto faceColor = [](bool active) -> ImU32 {
+        return active ? IM_COL32(255, 165, 0, 220) : IM_COL32(80, 80, 90, 180);
+    };
+
+    // Isometric projection helpers
+    auto proj = [&](float x, float y, float z) -> ImVec2 {
+        // Simple isometric: x→right, y→up, z→down-right
+        return ImVec2(cx + (x - z) * 0.707f * hs,
+                      cy - y * hs + (x + z) * 0.354f * hs);
+    };
+
+    // Current view direction for highlight
+    Vec3 curDir(std::sin(m_yaw) * std::cos(m_pitch),
+                std::sin(m_pitch),
+                std::cos(m_yaw) * std::cos(m_pitch));
+    curDir = glm::normalize(curDir);
+
+    // --- FACES ---
+    struct Face { const char* label; float nx, ny, nz; };
+    static const Face faces[] = {
+        {"F",  0, 0, 1},  // Front
+        {"B",  0, 0,-1},  // Back
+        {"L", -1, 0, 0},  // Left
+        {"R",  1, 0, 0},  // Right
+        {"T",  0, 1, 0},  // Top
+        {"D",  0,-1, 0},  // Bottom
+    };
+
+    for (const auto& f : faces) {
+        ImVec2 p = proj(f.nx * 1.3f, f.ny * 1.3f, f.nz * 1.3f);
+        Vec3 fn(f.nx, f.ny, f.nz);
+        float dot = glm::dot(curDir, fn);
+        bool active = (dot > 0.85f);
+
+        dl->AddRectFilled(ImVec2(p.x - 14, p.y - 9), ImVec2(p.x + 14, p.y + 9),
+                          faceColor(active), 3.0f);
+        dl->AddText(ImVec2(p.x - 5, p.y - 6),
+                    IM_COL32(255, 255, 255, 255), f.label);
+
+        // Click detection via ImGui InvisibleButton
+        ImGui::SetCursorScreenPos(ImVec2(p.x - 14, p.y - 9));
+        ImGui::InvisibleButton(f.label, ImVec2(28, 18));
+        if (ImGui::IsItemClicked()) {
+            setViewDirection(Vec3(f.nx, f.ny, f.nz), Vec3(0, 1, 0));
+        }
+    }
+
+    // --- CORNERS (isometric) ---
+    static const struct { const char* label; float x, y, z; } corners[] = {
+        {"ISO", 1, 1, 1},
+    };
+    for (const auto& c : corners) {
+        ImVec2 p = proj(c.x * 1.5f, c.y * 1.5f, c.z * 1.5f);
+        dl->AddCircleFilled(p, 6.0f, IM_COL32(100, 100, 120, 200));
+        ImGui::SetCursorScreenPos(ImVec2(p.x - 8, p.y - 8));
+        ImGui::InvisibleButton(c.label, ImVec2(16, 16));
+        if (ImGui::IsItemClicked()) {
+            Vec3 iso = glm::normalize(Vec3(1, 1, 1));
+            setViewDirection(iso, Vec3(0, 1, 0));
+        }
+    }
+}
+
 // Draw selection box overlay during drag
 void ViewportPanel::drawSelectionBox() {
     if (!m_isBoxSelecting) return;
@@ -749,6 +857,7 @@ void ViewportPanel::draw() {
 
     orbitCamera();
     render3D();
+    drawViewCube();
 
     // Right-click context menu on viewport image
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
@@ -944,7 +1053,7 @@ MenuAction UIManager::showMainMenu() {
     MenuAction action = MenuAction::None;
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Open STEP...", "Cmd+O")) action = MenuAction::OpenSTEP;
+            if (ImGui::MenuItem("Open CAD...", "Cmd+O")) action = MenuAction::OpenCAD;
             ImGui::Separator();
             if (ImGui::MenuItem("Export glTF...", "Cmd+E")) action = MenuAction::ExportglTF;
             if (ImGui::MenuItem("Export STL...")) action = MenuAction::ExportSTL;
@@ -1080,6 +1189,30 @@ void SceneTreePanel::draw() {
     ImGui::Text("Nodes: %d | Selected: %zu", nodeCount - 1, m_selection.size());
     ImGui::Separator();
     drawNode(m_scene->root().get());
+
+    // Context menu — must be outside drawNode() recursion so BeginPopup
+    // runs exactly once per frame. OpenPopup is called from within drawNode.
+    if (ImGui::BeginPopup("SceneTreeCtxMenu")) {
+        size_t selCount = m_selectedNodes.size();
+        if (selCount > 0) {
+            ImGui::Text("%zu selected", selCount);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete")) {
+                if (auto* cb = getActionCbs()) cb->onDeleteSelected();
+            }
+            if (ImGui::MenuItem("Export glTF")) {
+                if (auto* cb = getActionCbs()) cb->onExportSelectedglTF();
+            }
+            if (ImGui::MenuItem("Export STL")) {
+                if (auto* cb = getActionCbs()) cb->onExportSelectedSTL();
+            }
+            if (selCount >= 2 && ImGui::MenuItem("Group (Merge)")) {
+                if (auto* cb = getActionCbs()) cb->onGroupSelected();
+            }
+        }
+        ImGui::EndPopup();
+    }
+
     // Force-expand only lasts one frame
     m_forceExpand.clear();
 }
@@ -1091,6 +1224,8 @@ void SceneTreePanel::drawNode(SceneNode* node) {
     if (m_forceExpand.count(node->id())) {
         ImGui::SetNextItemOpen(true);
     }
+
+    bool isScrollTarget = (node->id() == m_scrollToNode && m_scrollToNode != 0);
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
     if (node->children().empty()) flags |= ImGuiTreeNodeFlags_Leaf;
@@ -1106,6 +1241,12 @@ void SceneTreePanel::drawNode(SceneNode* node) {
     }
     std::string label = std::string(icon) + node->name();
     bool open = ImGui::TreeNodeEx((void*)(uintptr_t)node->id(), flags, "%s", label.c_str());
+
+    // Scroll to target node (set by viewport pick)
+    if (isScrollTarget) {
+        ImGui::SetScrollHereY();
+        m_scrollToNode = 0; // one-shot
+    }
 
     if (ImGui::IsItemClicked()) {
         bool ctrl = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper;
@@ -1153,27 +1294,6 @@ void SceneTreePanel::drawNode(SceneNode* node) {
         ImGui::OpenPopup("SceneTreeCtxMenu");
     }
 
-    if (ImGui::BeginPopup("SceneTreeCtxMenu")) {
-        size_t selCount = m_selectedNodes.size();
-        if (selCount > 0) {
-            ImGui::Text("%zu selected", selCount);
-            ImGui::Separator();
-            if (ImGui::MenuItem("Delete")) {
-                if (auto* cb = getActionCbs()) cb->onDeleteSelected();
-            }
-            if (ImGui::MenuItem("Export glTF")) {
-                if (auto* cb = getActionCbs()) cb->onExportSelectedglTF();
-            }
-            if (ImGui::MenuItem("Export STL")) {
-                if (auto* cb = getActionCbs()) cb->onExportSelectedSTL();
-            }
-            if (selCount >= 2 && ImGui::MenuItem("Group (Merge)")) {
-                if (auto* cb = getActionCbs()) cb->onGroupSelected();
-            }
-        }
-        ImGui::EndPopup();
-    }
-
     if (open) {
         for (auto& child : node->children()) drawNode(child.get());
         ImGui::TreePop();
@@ -1200,6 +1320,10 @@ void SceneTreePanel::setSelection(const std::unordered_set<EntityId>& ids) {
         // Auto-expand all ancestors of selected nodes
         for (auto& sn : m_selectedNodes) {
             collectAncestors(sn.get(), m_forceExpand);
+        }
+        // Scroll to the first selected node
+        if (!m_selectedNodes.empty()) {
+            m_scrollToNode = m_selectedNodes.front()->id();
         }
     }
 }

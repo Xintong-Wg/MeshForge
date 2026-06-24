@@ -17,6 +17,7 @@
 #include "IO/STLExporter.h"
 #include <memory>
 #include <string>
+#include <mutex>
 
 struct SDL_Window;
 using SDL_GLContext = void*;
@@ -32,6 +33,7 @@ struct PipelineConfig {
     LODGenerator::Params lod;
     glTFExportOptions exportOpt;
     std::string cacheDir = "./cache";
+    bool enableImportCache = false;   // cold imports are faster without writing BRep/mesh cache
     bool useCADAwarePipeline = false; // CAD-aware analysis + adaptive tessellation
     bool useFastImport = true;        // skip shell extraction, parallel tessellation
     int importThreads = 0;            // 0 = auto (use all cores)
@@ -58,7 +60,7 @@ public:
     void runFrame();
     void processEvents();
 
-    void loadSTEP(const std::string& filepath);
+    void loadCAD(const std::string& filepath);
     void processAll();
     void processCADAware();  // new CAD-aware pipeline
     void simplifySelected(const std::vector<std::shared_ptr<SceneNode>>& nodes,
@@ -80,7 +82,13 @@ public:
     float progress() const;
 
 private:
-    void buildSceneFromSTEP();
+    struct PendingSimplifyResult {
+        std::string shapeKey;
+        MeshData mesh;
+    };
+
+    void buildSceneFromCAD();
+    void applyPendingSimplifyResults();
 
     PipelineConfig m_config;
 
@@ -129,6 +137,8 @@ private:
 
     // Thread-safe viewport mesh rebuild: worker sets flag, main thread does the rebuild
     bool m_viewportMeshDirty = false;
+    std::mutex m_pendingSimplifyMutex;
+    std::vector<PendingSimplifyResult> m_pendingSimplifyResults;
 
     // Track previous selection for highlight updates
     std::unordered_set<EntityId> m_prevSelection;

@@ -301,7 +301,8 @@ void AdaptiveTessellator::Impl::tessellatePlanarFace(
     // Use OCC BRepMesh with generous deflection for planar surfaces
     // Planar surfaces have zero curvature, so deflection only controls edge refinement
     float planarDeflection = cf.maxEdgeLength * 2.0f;
-    BRepMesh_IncrementalMesh incMesh(face, planarDeflection, Standard_False, 0.5, Standard_True);
+    BRepMesh_IncrementalMesh incMesh(face, planarDeflection, Standard_False, 0.5,
+                                     params.parallelMeshing ? Standard_True : Standard_False);
 
     SurfaceTag tag = makeTag(SurfaceCategory::Planar, TessellationStrategy::PlanarBoundary);
 
@@ -601,7 +602,8 @@ void AdaptiveTessellator::Impl::tessellateFreeformFace(
     }
 
     BRepMesh_IncrementalMesh incMesh(face, linDefl, Standard_False,
-                                      params.freeformAngularDeflection, Standard_True);
+                                      params.freeformAngularDeflection,
+                                      params.parallelMeshing ? Standard_True : Standard_False);
 
     SurfaceTag tag = makeTag(fa.category, TessellationStrategy::FreeformAdaptive);
 
@@ -677,7 +679,8 @@ MeshData AdaptiveTessellator::Impl::tessellateUniformImpl(
     }
 
     BRepMesh_IncrementalMesh incMesh(shape, linDefl, Standard_False,
-                                      params.freeformAngularDeflection, Standard_True);
+                                      params.freeformAngularDeflection,
+                                      params.parallelMeshing ? Standard_True : Standard_False);
 
     uint32_t vertOff = 0;
     TopExp_Explorer faceExp(shape, TopAbs_FACE);

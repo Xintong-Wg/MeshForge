@@ -21,6 +21,7 @@ struct TessellationParams {
     float angularDeflection = 0.5f;  // angular deviation (rad)
     bool  relative = true;           // relative to bounding box
     float minEdgeLength = 0.01f;     // ignore edges shorter than this
+    bool  parallelMeshing = true;    // let OpenCASCADE parallelize inside one shape
 };
 
 // ------------------------------------------------------------------

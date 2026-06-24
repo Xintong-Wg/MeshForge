@@ -1,9 +1,11 @@
 #include "Mesh/MeshData.h"
 #include "Core/Logger.h"
 #include <glm/glm.hpp>
+#include <glm/gtx/norm.hpp>
 #include <unordered_map>
 #include <fstream>
 #include <cstring>
+#include <cmath>
 
 namespace mf {
 
@@ -23,21 +25,28 @@ void MeshData::computeAABB() {
 void MeshData::computeNormals() {
     for (auto& v : vertices) v.normal = Vec3(0.0f);
 
-    for (size_t i = 0; i < indices.size(); i += 3) {
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
         uint32_t i0 = indices[i];
         uint32_t i1 = indices[i + 1];
         uint32_t i2 = indices[i + 2];
+        if (i0 >= vertices.size() || i1 >= vertices.size() || i2 >= vertices.size()) continue;
         Vec3 p0 = vertices[i0].position;
         Vec3 p1 = vertices[i1].position;
         Vec3 p2 = vertices[i2].position;
-        Vec3 n = glm::normalize(glm::cross(p1 - p0, p2 - p0));
+        Vec3 c = glm::cross(p1 - p0, p2 - p0);
+        if (glm::length2(c) < 1e-20f) continue;
+        Vec3 n = glm::normalize(c);
         vertices[i0].normal += n;
         vertices[i1].normal += n;
         vertices[i2].normal += n;
     }
 
     for (auto& v : vertices) {
-        v.normal = glm::normalize(v.normal);
+        if (glm::length2(v.normal) > 1e-20f) {
+            v.normal = glm::normalize(v.normal);
+        } else {
+            v.normal = Vec3(0, 1, 0);
+        }
     }
 }
 
@@ -45,10 +54,11 @@ void MeshData::computeTangents() {
     std::vector<Vec3> tangents(vertices.size(), Vec3(0.0f));
     std::vector<Vec3> bitangents(vertices.size(), Vec3(0.0f));
 
-    for (size_t i = 0; i < indices.size(); i += 3) {
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
         uint32_t i0 = indices[i];
         uint32_t i1 = indices[i + 1];
         uint32_t i2 = indices[i + 2];
+        if (i0 >= vertices.size() || i1 >= vertices.size() || i2 >= vertices.size()) continue;
 
         Vec3 p0 = vertices[i0].position;
         Vec3 p1 = vertices[i1].position;
@@ -64,7 +74,9 @@ void MeshData::computeTangents() {
         Vec2 duv1 = uv1 - uv0;
         Vec2 duv2 = uv2 - uv0;
 
-        float f = 1.0f / (duv1.x * duv2.y - duv2.x * duv1.y + 1e-8f);
+        float denom = duv1.x * duv2.y - duv2.x * duv1.y;
+        if (std::abs(denom) < 1e-8f) continue;
+        float f = 1.0f / denom;
         Vec3 t = f * (duv2.y * e1 - duv1.y * e2);
         Vec3 b = f * (-duv2.x * e1 + duv1.x * e2);
 
@@ -78,9 +90,11 @@ void MeshData::computeTangents() {
 
     for (size_t i = 0; i < vertices.size(); ++i) {
         Vec3 n = vertices[i].normal;
-        Vec3 t = glm::normalize(tangents[i]);
+        if (glm::length2(n) < 1e-20f) n = Vec3(0, 1, 0);
+        Vec3 t = (glm::length2(tangents[i]) > 1e-20f) ? glm::normalize(tangents[i]) : Vec3(1, 0, 0);
         // Gram-Schmidt
-        t = glm::normalize(t - n * glm::dot(n, t));
+        Vec3 ortho = t - n * glm::dot(n, t);
+        t = (glm::length2(ortho) > 1e-20f) ? glm::normalize(ortho) : Vec3(1, 0, 0);
         float w = (glm::dot(glm::cross(n, t), bitangents[i]) < 0.0f) ? -1.0f : 1.0f;
         vertices[i].tangent = Vec4(t, w);
     }

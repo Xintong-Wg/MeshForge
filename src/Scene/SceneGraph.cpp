@@ -25,12 +25,27 @@ void SceneNode::clearChildren() {
     m_children.clear();
 }
 
+void SceneNode::setLocalTransform(const Transform& t) {
+    m_local = t;
+    m_localMatrix = t.matrix();
+    m_useLocalMatrix = false;
+    markDirty();
+}
+
+void SceneNode::setLocalMatrix(const Mat4& m) {
+    m_localMatrix = m;
+    m_local = mat4ToTransform(m);
+    m_useLocalMatrix = true;
+    markDirty();
+}
+
 Mat4 SceneNode::worldTransform() const {
     if (m_dirty) {
+        const Mat4 local = m_useLocalMatrix ? m_localMatrix : m_local.matrix();
         if (auto p = m_parent.lock()) {
-            m_world = p->worldTransform() * m_local.matrix();
+            m_world = p->worldTransform() * local;
         } else {
-            m_world = m_local.matrix();
+            m_world = local;
         }
         m_dirty = false;
     }

@@ -432,75 +432,85 @@ SimplifyResult FeatureSimplifier::Impl::simplifyVisual(
         MF_INFO("  Normal simplify stalled at {:.1f}% — welding + sloppy...",
                 static_cast<float>(bestTris) / static_cast<float>(sourceTris) * 100.0f);
 
-        // Weld vertices at same position (average normals)
         MeshData welded;
-        welded.vertices.reserve(input.vertices.size());
         welded.indices.reserve(input.indices.size());
-        std::unordered_map<uint64_t, uint32_t> posMap;
-        constexpr float kScale = 1e3f;
 
-        for (const auto& v : input.vertices) {
-            int64_t hx = static_cast<int64_t>(v.position.x * kScale);
-            int64_t hy = static_cast<int64_t>(v.position.y * kScale);
-            int64_t hz = static_cast<int64_t>(v.position.z * kScale);
-            uint64_t key = (static_cast<uint64_t>(hx) << 42)
-                         ^ (static_cast<uint64_t>(hy) << 21)
-                         ^ static_cast<uint64_t>(hz);
-            auto it = posMap.find(key);
-            if (it != posMap.end()) {
-                welded.vertices[it->second].normal += v.normal;
+        std::vector<std::pair<Vec3, uint32_t>> sorted;
+        sorted.reserve(input.vertices.size());
+        for (size_t i = 0; i < input.vertices.size(); ++i) {
+            sorted.emplace_back(input.vertices[i].position, static_cast<uint32_t>(i));
+        }
+        std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) {
+                if (a.first.x != b.first.x) return a.first.x < b.first.x;
+                if (a.first.y != b.first.y) return a.first.y < b.first.y;
+                return a.first.z < b.first.z;
+            });
+
+        std::vector<uint32_t> vertexRemap(input.vertices.size(), static_cast<uint32_t>(-1));
+        welded.vertices.reserve(input.vertices.size());
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            uint32_t srcIdx = sorted[i].second;
+            const Vec3& pos = sorted[i].first;
+            if (i > 0 && pos == sorted[i - 1].first) {
+                uint32_t weldedIdx = vertexRemap[sorted[i - 1].second];
+                vertexRemap[srcIdx] = weldedIdx;
+                welded.vertices[weldedIdx].normal += input.vertices[srcIdx].normal;
             } else {
-                posMap[key] = static_cast<uint32_t>(welded.vertices.size());
-                welded.vertices.push_back(v);
+                uint32_t weldedIdx = static_cast<uint32_t>(welded.vertices.size());
+                vertexRemap[srcIdx] = weldedIdx;
+                welded.vertices.push_back(input.vertices[srcIdx]);
             }
         }
-        for (auto& v : welded.vertices) v.normal = glm::normalize(v.normal);
+
+        for (auto& v : welded.vertices) {
+            float len = glm::length(v.normal);
+            v.normal = (len > 1e-10f) ? (v.normal / len) : Vec3(0, 1, 0);
+        }
+
         for (auto idx : input.indices) {
-            const auto& v = input.vertices[idx];
-            int64_t hx = static_cast<int64_t>(v.position.x * kScale);
-            int64_t hy = static_cast<int64_t>(v.position.y * kScale);
-            int64_t hz = static_cast<int64_t>(v.position.z * kScale);
-            uint64_t key = (static_cast<uint64_t>(hx) << 42)
-                         ^ (static_cast<uint64_t>(hy) << 21)
-                         ^ static_cast<uint64_t>(hz);
-            welded.indices.push_back(posMap[key]);
+            welded.indices.push_back(vertexRemap[idx]);
         }
 
-        MF_INFO("  Welded: {} -> {} verts", input.vertexCount(), welded.vertexCount());
+        if (welded.indices.size() % 3 != 0) {
+            MF_WARN("  Welded mesh has invalid index count; skipping sloppy fallback");
+        } else {
+            MF_INFO("  Welded: {} -> {} verts", input.vertexCount(), welded.vertexCount());
 
-        std::vector<unsigned int> sloppyIndices(welded.indices.begin(), welded.indices.end());
-        float sloppyError = 0.0f;
-        size_t sloppyCount = meshopt_simplifySloppy(
-            sloppyIndices.data(), welded.indices.data(),
-            static_cast<size_t>(welded.indexCount()),
-            reinterpret_cast<const float*>(welded.vertices.data()),
-            static_cast<size_t>(welded.vertexCount()), sizeof(Vertex),
-            static_cast<size_t>(targetTris * 3), 1e10f, &sloppyError
-        );
-        sloppyIndices.resize(sloppyCount);
+            std::vector<unsigned int> sloppyIndices(welded.indices.begin(), welded.indices.end());
+            float sloppyError = 0.0f;
+            size_t sloppyCount = meshopt_simplifySloppy(
+                sloppyIndices.data(), welded.indices.data(),
+                static_cast<size_t>(welded.indexCount()),
+                reinterpret_cast<const float*>(welded.vertices.data()),
+                static_cast<size_t>(welded.vertexCount()), sizeof(Vertex),
+                static_cast<size_t>(targetTris * 3), 1e10f, &sloppyError
+            );
+            sloppyIndices.resize(sloppyCount);
 
-        uint32_t sloppyTris = static_cast<uint32_t>(sloppyCount / 3);
-        MF_INFO("  Sloppy: {} -> {} tris", sourceTris, sloppyTris);
-        if (sloppyCount > 0 && sloppyTris < bestTris) {
-            std::vector<unsigned int> remap(welded.vertexCount());
-            size_t unique = meshopt_optimizeVertexFetchRemap(
-                remap.data(), sloppyIndices.data(), sloppyIndices.size(), welded.vertexCount());
-            MeshData sloppyMesh;
-            sloppyMesh.vertices.resize(unique);
-            for (size_t i = 0; i < welded.vertexCount(); ++i) {
-                if (remap[i] < unique) sloppyMesh.vertices[remap[i]] = welded.vertices[i];
+            uint32_t sloppyTris = static_cast<uint32_t>(sloppyCount / 3);
+            MF_INFO("  Sloppy: {} -> {} tris", sourceTris, sloppyTris);
+            if (sloppyCount > 0 && sloppyTris < bestTris) {
+                std::vector<unsigned int> remap(welded.vertexCount());
+                size_t unique = meshopt_optimizeVertexFetchRemap(
+                    remap.data(), sloppyIndices.data(), sloppyIndices.size(), welded.vertexCount());
+                MeshData sloppyMesh;
+                sloppyMesh.vertices.resize(unique);
+                for (size_t i = 0; i < welded.vertexCount(); ++i) {
+                    if (remap[i] < unique) sloppyMesh.vertices[remap[i]] = welded.vertices[i];
+                }
+                sloppyMesh.indices.resize(sloppyIndices.size());
+                for (size_t i = 0; i < sloppyIndices.size(); ++i)
+                    sloppyMesh.indices[i] = static_cast<Index>(remap[sloppyIndices[i]]);
+                sloppyMesh.computeNormals();
+                sloppyMesh.computeTangents();
+                sloppyMesh.computeAABB();
+                result.mesh = std::move(sloppyMesh);
+                result.usedSloppy = true;
+                result.usedError = sloppyError;
+                bestTris = sloppyTris;
+                ++result.passes;
             }
-            sloppyMesh.indices.resize(sloppyIndices.size());
-            for (size_t i = 0; i < sloppyIndices.size(); ++i)
-                sloppyMesh.indices[i] = static_cast<Index>(remap[sloppyIndices[i]]);
-            sloppyMesh.computeNormals();
-            sloppyMesh.computeTangents();
-            sloppyMesh.computeAABB();
-            result.mesh = std::move(sloppyMesh);
-            result.usedSloppy = true;
-            result.usedError = sloppyError;
-            bestTris = sloppyTris;
-            ++result.passes;
         }
     }
 

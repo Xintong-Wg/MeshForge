@@ -70,6 +70,7 @@ private:
     std::vector<std::shared_ptr<SceneNode>> m_selectedNodes;
     std::unordered_set<EntityId> m_selection;
     std::unordered_set<EntityId> m_forceExpand;  // auto-expand ancestors on selection
+    EntityId m_scrollToNode = 0;  // scroll to this node on next draw
     EntityId m_lastClickedNode = 0;  // for Shift-click range selection
 };
 
@@ -215,6 +216,10 @@ private:
     void doRayPick(float mouseX, float mouseY);
     void doBoxPick(float x0, float y0, float x1, float y1);
     void drawSelectionBox();
+    void drawViewCube();
+
+    // Set camera to a named view direction
+    void setViewDirection(const Vec3& dir, const Vec3& up);
 };
 
 // ------------------------------------------------------------------
@@ -259,7 +264,7 @@ private:
 // ------------------------------------------------------------------
 // Menu action types
 // ------------------------------------------------------------------
-enum class MenuAction { None, OpenSTEP, ExportglTF, ExportSTL, ExportSelectedglTF,
+enum class MenuAction { None, OpenCAD, ExportglTF, ExportSTL, ExportSelectedglTF,
     ExportSelectedSTL, BatchExportSelected, Exit,
     TessellateAll, GenerateLOD, SimplifyAll, UndoSelected, ResetSelected,
     DeleteSelected };

@@ -21,8 +21,30 @@
 #include <opencascade/TopoDS.hxx>
 #include <opencascade/BRepBndLib.hxx>
 #include <opencascade/Bnd_Box.hxx>
+#include <glm/gtx/norm.hpp>
+
+#include <cmath>
+#include <limits>
+#include <vector>
 
 namespace mf {
+
+static bool isUsableCoord(Standard_Real v) {
+    constexpr Standard_Real kMaxReasonableCoord = 1.0e12;
+    return std::isfinite(v) && std::abs(v) < kMaxReasonableCoord;
+}
+
+static bool isUsablePoint(const gp_Pnt& p) {
+    return isUsableCoord(p.X()) && isUsableCoord(p.Y()) && isUsableCoord(p.Z());
+}
+
+static Vec3 safeNormal(Vec3 normal) {
+    if (!std::isfinite(normal.x) || !std::isfinite(normal.y) || !std::isfinite(normal.z) ||
+        glm::length2(normal) < 1e-20f) {
+        return Vec3(0, 0, 1);
+    }
+    return glm::normalize(normal);
+}
 
 // Compute normal at UV param on surface
 static Vec3 computeNormal(const TopoDS_Face& face, const Handle(Poly_Triangulation)& tri,
@@ -119,9 +141,8 @@ BRepMesh BRepEngine::Impl::doTessellate(const TopoDS_Shape& shape, const TopLoc_
 
     BRepMesh_IncrementalMesh incMesh(shape, linDefl, Standard_False,
                                      static_cast<Standard_Real>(params.angularDeflection),
-                                     Standard_True);
+                                     params.parallelMeshing ? Standard_True : Standard_False);
 
-    uint32_t vertexOffset = 0;
     TopExp_Explorer faceExp(shape, TopAbs_FACE);
     for (; faceExp.More(); faceExp.Next()) {
         TopoDS_Face face = TopoDS::Face(faceExp.Current());
@@ -136,9 +157,12 @@ BRepMesh BRepEngine::Impl::doTessellate(const TopoDS_Shape& shape, const TopLoc_
         gp_Trsf trsf = totalLoc.Transformation();
 
         bool hasUV = tri->HasUVNodes();
+        std::vector<Index> remap(static_cast<size_t>(nbNodes) + 1,
+                                 std::numeric_limits<Index>::max());
 
         for (Standard_Integer n = 1; n <= nbNodes; ++n) {
             gp_Pnt p = tri->Node(n).Transformed(trsf);
+            if (!isUsablePoint(p)) continue;
             Vec3 pos(static_cast<float>(p.X()), static_cast<float>(p.Y()), static_cast<float>(p.Z()));
             mesh.aabb.expand(pos);
 
@@ -150,26 +174,41 @@ BRepMesh BRepEngine::Impl::doTessellate(const TopoDS_Shape& shape, const TopLoc_
                 normal = computeNormal(face, tri, n, uvNode);
             }
 
+            remap[static_cast<size_t>(n)] = static_cast<Index>(mesh.vertices.size());
             Vertex v;
             v.position = pos;
-            v.normal = normal;
+            v.normal = safeNormal(normal);
             v.uv = uv;
             v.tangent = Vec4(1, 0, 0, 1);
             mesh.vertices.push_back(v);
         }
 
+        uint32_t validTriangles = 0;
         for (Standard_Integer t = 1; t <= nbTriangles; ++t) {
             const Poly_Triangle& triangle = tri->Triangle(t);
             Standard_Integer n1, n2, n3;
             triangle.Get(n1, n2, n3);
-            mesh.indices.push_back(vertexOffset + (n1 - 1));
-            mesh.indices.push_back(vertexOffset + (n2 - 1));
-            mesh.indices.push_back(vertexOffset + (n3 - 1));
+            if (n1 < 1 || n1 > nbNodes || n2 < 1 || n2 > nbNodes || n3 < 1 || n3 > nbNodes) {
+                continue;
+            }
+            Index i1 = remap[static_cast<size_t>(n1)];
+            Index i2 = remap[static_cast<size_t>(n2)];
+            Index i3 = remap[static_cast<size_t>(n3)];
+            if (i1 == std::numeric_limits<Index>::max() ||
+                i2 == std::numeric_limits<Index>::max() ||
+                i3 == std::numeric_limits<Index>::max()) {
+                continue;
+            }
+            mesh.indices.push_back(i1);
+            mesh.indices.push_back(i2);
+            mesh.indices.push_back(i3);
+            ++validTriangles;
         }
 
-        vertexOffset += static_cast<uint32_t>(nbNodes);
-        ++mesh.faceCount;
-        mesh.triangleCount += static_cast<uint32_t>(nbTriangles);
+        if (validTriangles > 0) {
+            ++mesh.faceCount;
+            mesh.triangleCount += validTriangles;
+        }
     }
 
     MF_INFO("BRepEngine: {} vertices, {} triangles from {} faces",

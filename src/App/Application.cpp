@@ -190,6 +190,8 @@ void Application::runFrame() {
     m_ui.beginFrame();
     MenuAction action = m_ui.showMainMenu();
 
+    applyPendingSimplifyResults();
+
     // Rebuild viewport mesh BEFORE endFrame so the viewport sees the new mesh this frame
     if (m_viewportMeshDirty) {
         m_viewportMeshDirty = false;
@@ -201,9 +203,9 @@ void Application::runFrame() {
 
     // Handle menu actions
     switch (action) {
-    case MenuAction::OpenSTEP: {
+    case MenuAction::OpenCAD: {
         std::string path = m_ui.openFileDialog();
-        if (!path.empty()) loadSTEP(path);
+        if (!path.empty()) loadCAD(path);
         break;
     }
     case MenuAction::ExportglTF: {
@@ -368,22 +370,25 @@ void Application::runFrame() {
     SDL_GL_SwapWindow(m_window);
 }
 
-void Application::loadSTEP(const std::string& filepath) {
-    MF_INFO("Loading STEP: {}", filepath);
+void Application::loadCAD(const std::string& filepath) {
+    MF_INFO("Loading CAD file: {}", filepath);
     auto t0 = std::chrono::steady_clock::now();
 
-    // Compute cache dir from file hash for BRep binary cache
+    // Compute cache dir from file hash for optional BRep binary cache.
     std::hash<std::string> hasher;
-    std::string brepCacheDir = m_config.cacheDir + "/brep_" + std::to_string(hasher(filepath));
+    std::string brepCacheDir;
+    if (m_config.enableImportCache) {
+        brepCacheDir = m_config.cacheDir + "/brep_" + std::to_string(hasher(filepath));
+    }
 
     m_stepResult = m_stepReader.read(filepath, brepCacheDir);
     if (!m_stepResult || !m_stepResult->root) {
-        MF_ERROR("Import failed: could not parse STEP file");
+        MF_ERROR("Import failed: could not parse CAD file");
         return;
     }
 
     auto t1 = std::chrono::steady_clock::now();
-    MF_INFO("STEP parse: {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+    MF_INFO("CAD parse: {} ms", std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
     m_partMeshes.clear();
     m_partSimplifyStates.clear();
@@ -416,13 +421,15 @@ void Application::loadSTEP(const std::string& filepath) {
         tbb::parallel_for(tbb::blocked_range<size_t>(0, shapes.size()),
             [&](const tbb::blocked_range<size_t>& r) {
                 AdaptiveTessellator localTess;
+                AdaptiveTessellationParams localParams = m_config.adaptiveTessellation;
+                localParams.parallelMeshing = false;
                 for (size_t i = r.begin(); i != r.end(); ++i) {
                     auto& [key, shape] = shapes[i];
                     auto classIt = m_classifications.find(key);
                     if (classIt == m_classifications.end()) continue;
 
                     TaggedMesh tm = localTess.tessellate(
-                        shape, classIt->second, m_config.adaptiveTessellation);
+                        shape, classIt->second, localParams);
                     if (!tm.mesh.vertices.empty()) {
                         tm.mesh.computeAABB();
                         taggedResults[i] = std::move(tm);
@@ -494,10 +501,13 @@ void Application::loadSTEP(const std::string& filepath) {
         // --- Fast uniform tessellation (parallel, with disk cache) ---
         MF_INFO("Fast uniform tessellation for {} shapes...", shapes.size());
 
-        // Compute cache directory from file hash
+        // Compute cache directory from file hash when cache is enabled.
         std::hash<std::string> hasher;
-        std::string cacheDir = m_config.cacheDir + "/" + std::to_string(hasher(filepath));
-        std::filesystem::create_directories(cacheDir);
+        std::string cacheDir;
+        if (m_config.enableImportCache) {
+            cacheDir = m_config.cacheDir + "/" + std::to_string(hasher(filepath));
+            std::filesystem::create_directories(cacheDir);
+        }
 
         std::vector<MeshData> meshResults(shapes.size());
         std::vector<bool> shapeValid(shapes.size(), false);
@@ -507,13 +517,17 @@ void Application::loadSTEP(const std::string& filepath) {
             [&](const tbb::blocked_range<size_t>& r) {
                 BRepEngine localEngine;
                 TessellationParams localParams = m_config.tessellation;
+                localParams.parallelMeshing = false;
                 for (size_t i = r.begin(); i != r.end(); ++i) {
                     auto& [key, shape] = shapes[i];
-                    std::string cachePath = cacheDir + "/" + key + ".mesh";
+                    std::string cachePath;
+                    if (m_config.enableImportCache) {
+                        cachePath = cacheDir + "/" + key + ".mesh";
+                    }
 
                     // Try cache first
                     MeshData md;
-                    if (md.loadFromFile(cachePath)) {
+                    if (m_config.enableImportCache && md.loadFromFile(cachePath)) {
                         meshResults[i] = std::move(md);
                         shapeValid[i] = true;
                         continue;
@@ -526,7 +540,9 @@ void Application::loadSTEP(const std::string& filepath) {
                             md.vertices = std::move(brepMesh.vertices);
                             md.indices = std::move(brepMesh.indices);
                             md.computeAABB();
-                            md.saveToFile(cachePath);
+                            if (m_config.enableImportCache) {
+                                md.saveToFile(cachePath);
+                            }
                             meshResults[i] = std::move(md);
                             shapeValid[i] = true;
                         }
@@ -564,7 +580,7 @@ void Application::loadSTEP(const std::string& filepath) {
     }
 
     // Build scene tree and viewport mesh ONCE after tessellation is complete
-    buildSceneFromSTEP();
+    buildSceneFromCAD();
     m_ui.setScene(m_scene);
     rebuildViewportMesh();
 
@@ -580,21 +596,22 @@ void Application::loadSTEP(const std::string& filepath) {
     MF_INFO("Import successful: {} parts", m_stepResult->partsById.size());
 }
 
-void Application::buildSceneFromSTEP() {
+void Application::buildSceneFromCAD() {
     if (!m_stepResult || !m_stepResult->root) return;
     m_scene->clear();
     m_partNodeIds.clear();
 
-    std::function<void(const std::shared_ptr<AssemblyNode>&, SceneNode*)> build =
-        [&](const auto& anode, SceneNode* parent) {
+    // Two-pass build:
+    //   Pass 1: create all scene nodes and map assembly node id -> scene node.
+    //   Pass 2: link instance nodes to their prototype scene nodes.
+    std::unordered_map<std::string, std::shared_ptr<SceneNode>> nodeMap;
+
+    std::function<std::shared_ptr<SceneNode>(const std::shared_ptr<AssemblyNode>&, SceneNode*)> buildFirstPass =
+        [&](const auto& anode, SceneNode* parent) -> std::shared_ptr<SceneNode> {
             auto type = (anode->type == AssemblyNode::Type::Assembly)
                         ? SceneNode::Type::Group : SceneNode::Type::Mesh;
             auto snode = std::make_shared<SceneNode>(anode->name, type);
-            snode->setLocalTransform(mat4ToTransform(anode->localTransform));
-
-            if (anode->isInstance && !anode->prototypeId.empty()) {
-                snode->setPrototype(m_scene->root());
-            }
+            snode->setLocalMatrix(anode->localTransform);
 
             // Attach mesh for part nodes and record partId -> sceneNodeId mapping
             if (type == SceneNode::Type::Mesh) {
@@ -606,14 +623,74 @@ void Application::buildSceneFromSTEP() {
                 m_partNodeIds[anode->id] = snode->id();
             }
 
-            parent->addChild(snode);
-            for (auto& child : anode->children) build(child, snode.get());
+            nodeMap[anode->id] = snode;
+
+            if (parent) {
+                parent->addChild(snode);
+            }
+
+            for (auto& child : anode->children) {
+                buildFirstPass(child, snode.get());
+            }
+            return snode;
         };
 
-    build(m_stepResult->root, m_scene->root().get());
+    auto rootNode = buildFirstPass(m_stepResult->root, m_scene->root().get());
+
+    // Pass 2: resolve instance prototypes using the map built in pass 1.
+    for (auto& [aid, snode] : nodeMap) {
+        auto ait = m_stepResult->partsById.find(aid);
+        if (ait != m_stepResult->partsById.end() && ait->second->isInstance) {
+            auto pit = nodeMap.find(ait->second->prototypeId);
+            if (pit != nodeMap.end()) {
+                snode->setPrototype(pit->second);
+            } else {
+                MF_WARN("Instance '{}' references unknown prototype '{}'", aid, ait->second->prototypeId);
+            }
+        }
+    }
+
     m_scene->detectInstances();
     MF_INFO("Scene built: {} nodes, {} part->node mappings",
-            m_stepResult->partsById.size(), m_partNodeIds.size());
+            nodeMap.size(), m_partNodeIds.size());
+}
+
+void Application::applyPendingSimplifyResults() {
+    std::vector<PendingSimplifyResult> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingSimplifyMutex);
+        if (m_pendingSimplifyResults.empty()) return;
+        pending.swap(m_pendingSimplifyResults);
+    }
+
+    size_t applied = 0;
+    for (auto& result : pending) {
+        auto stateIt = m_partSimplifyStates.find(result.shapeKey);
+        if (stateIt != m_partSimplifyStates.end()) {
+            if (stateIt->second.isSimplified && !stateIt->second.simplifiedMesh.vertices.empty()) {
+                stateIt->second.history.push_back(std::move(stateIt->second.simplifiedMesh));
+            }
+            stateIt->second.simplifiedMesh = std::move(result.mesh);
+            stateIt->second.isSimplified = true;
+
+            auto meshIt = m_partMeshes.find(result.shapeKey);
+            if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+                meshIt->second->lods[0].mesh = stateIt->second.simplifiedMesh;
+            }
+            ++applied;
+        } else {
+            auto meshIt = m_partMeshes.find(result.shapeKey);
+            if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
+                meshIt->second->lods[0].mesh = std::move(result.mesh);
+                ++applied;
+            }
+        }
+    }
+
+    if (applied > 0) {
+        m_viewportMeshDirty = true;
+        MF_INFO("Applied {} simplified mesh results", applied);
+    }
 }
 
 void Application::processAll() {
@@ -623,7 +700,7 @@ void Application::processAll() {
     }
 
     if (m_viewportMesh.triangleCount() == 0) {
-        MF_WARN("No mesh to process - load a STEP file first");
+        MF_WARN("No mesh to process - load a CAD file first");
         return;
     }
 
@@ -639,25 +716,35 @@ void Application::processAll() {
 
         size_t total = m_partSimplifyStates.size();
         size_t idx = 0;
-        for (auto& [key, state] : m_partSimplifyStates) {
+        std::vector<std::pair<std::string, MeshData>> inputs;
+        inputs.reserve(m_partSimplifyStates.size());
+        for (const auto& [key, state] : m_partSimplifyStates) {
+            inputs.emplace_back(key, state.originalMesh);
+        }
+
+        std::vector<PendingSimplifyResult> results;
+        results.reserve(inputs.size());
+        for (const auto& [key, originalMesh] : inputs) {
             t->setProgress(0.05f + 0.7f * static_cast<float>(idx) / static_cast<float>(total));
             t->setMessage("Simplifying: " + key);
 
-            auto sr = Simplifier::simplify(state.originalMesh, sp);
+            auto sr = Simplifier::simplify(originalMesh, sp);
             sr.mesh.computeNormals();
             sr.mesh.computeTangents();
-            state.simplifiedMesh = std::move(sr.mesh);
-            state.isSimplified = true;
-
-            auto meshIt = m_partMeshes.find(key);
-            if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
-                meshIt->second->lods[0].mesh = state.simplifiedMesh;
-            }
+            PendingSimplifyResult pending;
+            pending.shapeKey = key;
+            pending.mesh = std::move(sr.mesh);
+            results.push_back(std::move(pending));
             ++idx;
         }
 
         t->setProgress(0.85f);
-        m_viewportMeshDirty = true;
+        {
+            std::lock_guard<std::mutex> lock(m_pendingSimplifyMutex);
+            for (auto& result : results) {
+                m_pendingSimplifyResults.push_back(std::move(result));
+            }
+        }
 
         t->setProgress(1.0f);
         MF_INFO("Simplification complete: {} parts processed", total);
@@ -667,7 +754,7 @@ void Application::processAll() {
 
 void Application::processCADAware() {
     if (m_viewportMesh.triangleCount() == 0) {
-        MF_WARN("No mesh to process - load a STEP file first");
+        MF_WARN("No mesh to process - load a CAD file first");
         return;
     }
 
@@ -676,9 +763,29 @@ void Application::processCADAware() {
 
         size_t total = m_partSimplifyStates.size();
         size_t idx = 0;
-        for (auto& [key, state] : m_partSimplifyStates) {
+        struct CADAwareJobInput {
+            std::string shapeKey;
+            MeshData source;
+            std::vector<SurfaceTag> tags;
+        };
+        std::vector<CADAwareJobInput> inputs;
+        inputs.reserve(m_partSimplifyStates.size());
+        for (const auto& [key, state] : m_partSimplifyStates) {
+            CADAwareJobInput input;
+            input.shapeKey = key;
+            input.source = state.originalMesh;
+            auto tagsIt = m_taggedMeshes.find(key);
+            if (tagsIt != m_taggedMeshes.end()) {
+                input.tags = tagsIt->second.triangleTags;
+            }
+            inputs.push_back(std::move(input));
+        }
+
+        std::vector<PendingSimplifyResult> results;
+        results.reserve(inputs.size());
+        for (const auto& input : inputs) {
             t->setProgress(0.05f + 0.6f * static_cast<float>(idx) / static_cast<float>(total));
-            t->setMessage("Feature simplifying: " + key);
+            t->setMessage("Feature simplifying: " + input.shapeKey);
 
             SimplifyParams sp;
             sp.targetRatio = m_config.featureSimplification.targetRatio;
@@ -688,36 +795,38 @@ void Application::processCADAware() {
             sp.useSloppyFallback = true;
 
             SimplifyResult sr;
-            auto tagsIt = m_taggedMeshes.find(key);
-            if (tagsIt != m_taggedMeshes.end() && !tagsIt->second.triangleTags.empty()) {
-                sr = m_featureSimplifier.simplifyV2(
-                    state.originalMesh, sp, &tagsIt->second.triangleTags);
+            if (!input.tags.empty()) {
+                sr = m_featureSimplifier.simplifyV2(input.source, sp, &input.tags);
             } else {
-                sr = m_featureSimplifier.simplifyV2(state.originalMesh, sp, nullptr);
+                sr = m_featureSimplifier.simplifyV2(input.source, sp, nullptr);
             }
 
             sr.mesh.computeNormals();
             sr.mesh.computeTangents();
-            state.simplifiedMesh = std::move(sr.mesh);
-            state.isSimplified = true;
-
-            auto meshIt = m_partMeshes.find(key);
-            if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
-                meshIt->second->lods[0].mesh = state.simplifiedMesh;
-            }
+            PendingSimplifyResult pending;
+            pending.shapeKey = input.shapeKey;
+            pending.mesh = std::move(sr.mesh);
+            results.push_back(std::move(pending));
             ++idx;
         }
 
         t->setProgress(0.75f);
-        m_viewportMeshDirty = true;
+        {
+            std::lock_guard<std::mutex> lock(m_pendingSimplifyMutex);
+            for (auto& result : results) {
+                m_pendingSimplifyResults.push_back(std::move(result));
+            }
+        }
 
         t->setProgress(0.90f); t->setMessage("Generating stats...");
 
         // Log pipeline statistics
         size_t totalBefore = 0, totalAfter = 0;
-        for (auto& [key, state] : m_partSimplifyStates) {
-            totalBefore += state.originalMesh.triangleCount();
-            totalAfter += state.simplifiedMesh.triangleCount();
+        for (const auto& input : inputs) {
+            totalBefore += input.source.triangleCount();
+        }
+        for (const auto& result : results) {
+            totalAfter += result.mesh.triangleCount();
         }
         MF_INFO("CAD-Aware simplification: {} → {} triangles ({:.1f}% reduction)",
                 totalBefore, totalAfter,
@@ -742,71 +851,95 @@ void Application::simplifySelected(const std::vector<std::shared_ptr<SceneNode>>
             params.targetError, params.preserveBoundary,
             params.useSloppyFallback, nodes.size());
 
-    auto task = std::make_shared<Task>("Simplify Selected", [this, nodes, params](Task* t) {
+    struct SimplifyJobInput {
+        std::string shapeKey;
+        std::string nodeName;
+        MeshData source;
+        std::vector<SurfaceTag> tags;
+    };
+
+    std::vector<SimplifyJobInput> inputs;
+    inputs.reserve(nodes.size());
+    for (auto& node : nodes) {
+        if (!node || !node->mesh() || node->mesh()->lods.empty()) continue;
+
+        const auto& lodMesh = node->mesh();
+        std::string key = lodMesh->name;
+        auto stateIt = m_partSimplifyStates.find(key);
+
+        const MeshData* source = nullptr;
+        if (stateIt != m_partSimplifyStates.end()) {
+            source = &stateIt->second.originalMesh;
+        } else {
+            source = &lodMesh->lods[0].mesh;
+        }
+        if (!source || source->triangleCount() == 0) {
+            MF_WARN("Skipping '{}' — source mesh has 0 triangles", node->name());
+            continue;
+        }
+
+        SimplifyJobInput input;
+        input.shapeKey = key;
+        input.nodeName = node->name();
+        input.source = *source;
+        if (m_config.useCADAwarePipeline) {
+            auto tagsIt = m_taggedMeshes.find(key);
+            if (tagsIt != m_taggedMeshes.end()) {
+                input.tags = tagsIt->second.triangleTags;
+            }
+        }
+        inputs.push_back(std::move(input));
+    }
+
+    if (inputs.empty()) {
+        MF_WARN("No valid meshes selected for simplification");
+        return;
+    }
+
+    auto task = std::make_shared<Task>("Simplify Selected", [this, inputs = std::move(inputs), params](Task* t) {
         t->setProgress(0.0f); t->setMessage("Simplifying selected parts...");
 
-        size_t total = nodes.size();
+        size_t total = inputs.size();
         size_t processed = 0;
         size_t totalBefore = 0, totalAfter = 0;
+        std::vector<PendingSimplifyResult> results;
+        results.reserve(inputs.size());
 
-        for (auto& node : nodes) {
-            if (!node->mesh() || node->mesh()->lods.empty()) continue;
-
-            const auto& lodMesh = node->mesh();
-            std::string key = lodMesh->name;
-
-            // ALWAYS simplify from the original mesh. This is the most reliable
-            // strategy: meshopt_simplify works best on the full tessellation,
-            // and repeated simplifications of an already-simplified mesh produce
-            // poor results.  The target ratio is always relative to original.
-            auto stateIt = m_partSimplifyStates.find(key);
-            const MeshData* source = nullptr;
-            if (stateIt != m_partSimplifyStates.end()) {
-                source = &stateIt->second.originalMesh;
-            } else {
-                source = &lodMesh->lods[0].mesh;
-            }
-
-            if (source->triangleCount() == 0) {
-                MF_WARN("Skipping '{}' — source mesh has 0 triangles", node->name());
-                continue;
-            }
-
+        for (const auto& input : inputs) {
             // Compute the effective ratio (relative to original)
             float effectiveRatio = params.targetRatio;
             if (params.mode == SimplifyMode::TargetFileSizeMB) {
-                effectiveRatio = ratioForTargetFileSize(*source, params.targetFileSizeMB);
+                effectiveRatio = ratioForTargetFileSize(input.source, params.targetFileSizeMB);
                 MF_INFO("FileSize mode: targetMB={:.2f} -> ratio={:.3f} for '{}'",
-                        params.targetFileSizeMB, effectiveRatio, node->name());
+                        params.targetFileSizeMB, effectiveRatio, input.nodeName);
             }
 
             // Clamp and validate
             effectiveRatio = std::clamp(effectiveRatio, 0.005f, 1.0f);
             if (effectiveRatio >= 1.0f) {
-                MF_INFO("Part '{}' effective ratio {:.3f} >= 1.0, skipping", node->name(), effectiveRatio);
+                MF_INFO("Part '{}' effective ratio {:.3f} >= 1.0, skipping", input.nodeName, effectiveRatio);
                 ++processed;
                 continue;
             }
 
-            t->setMessage("Simplifying: " + node->name());
-            totalBefore += source->triangleCount();
+            t->setMessage("Simplifying: " + input.nodeName);
+            totalBefore += input.source.triangleCount();
 
             // Run simplification
             SimplifyResult sr;
             if (m_config.useCADAwarePipeline) {
-                auto tagsIt = m_taggedMeshes.find(key);
                 SimplifyParams sp = params;
                 sp.targetRatio = effectiveRatio;
 
-                if (tagsIt != m_taggedMeshes.end() && !tagsIt->second.triangleTags.empty()) {
-                    sr = m_featureSimplifier.simplifyV2(*source, sp, &tagsIt->second.triangleTags);
+                if (!input.tags.empty()) {
+                    sr = m_featureSimplifier.simplifyV2(input.source, sp, &input.tags);
                 } else {
-                    sr = m_featureSimplifier.simplifyV2(*source, sp, nullptr);
+                    sr = m_featureSimplifier.simplifyV2(input.source, sp, nullptr);
                 }
             } else {
                 SimplifyParams sp = params;
                 sp.targetRatio = effectiveRatio;
-                sr = Simplifier::simplify(*source, sp);
+                sr = Simplifier::simplify(input.source, sp);
             }
 
             sr.mesh.computeNormals();
@@ -815,35 +948,26 @@ void Application::simplifySelected(const std::vector<std::shared_ptr<SceneNode>>
 
             MF_INFO("Part '{}' simplified: {} -> {} tris (target {:.3f}, achieved {:.3f}, "
                     "error {:.4f}, sloppy={}, passes={})",
-                    node->name(), source->triangleCount(), sr.mesh.triangleCount(),
+                    input.nodeName, input.source.triangleCount(), sr.mesh.triangleCount(),
                     effectiveRatio, sr.achievedRatio,
                     sr.usedError, sr.usedSloppy, sr.passes);
 
-            // Save current simplified state to history before overwriting
-            if (stateIt != m_partSimplifyStates.end()) {
-                if (stateIt->second.isSimplified && !stateIt->second.simplifiedMesh.vertices.empty()) {
-                    stateIt->second.history.push_back(std::move(stateIt->second.simplifiedMesh));
-                }
-                stateIt->second.simplifiedMesh = std::move(sr.mesh);
-                stateIt->second.isSimplified = true;
-
-                auto meshIt = m_partMeshes.find(key);
-                if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
-                    meshIt->second->lods[0].mesh = stateIt->second.simplifiedMesh;
-                }
-            } else {
-                auto meshIt = m_partMeshes.find(key);
-                if (meshIt != m_partMeshes.end() && !meshIt->second->lods.empty()) {
-                    meshIt->second->lods[0].mesh = std::move(sr.mesh);
-                }
-            }
+            PendingSimplifyResult pending;
+            pending.shapeKey = input.shapeKey;
+            pending.mesh = std::move(sr.mesh);
+            results.push_back(std::move(pending));
 
             ++processed;
             t->setProgress(static_cast<float>(processed) / static_cast<float>(total));
         }
 
         t->setProgress(0.95f);
-        m_viewportMeshDirty = true;
+        {
+            std::lock_guard<std::mutex> lock(m_pendingSimplifyMutex);
+            for (auto& result : results) {
+                m_pendingSimplifyResults.push_back(std::move(result));
+            }
+        }
         t->setProgress(1.0f);
         MF_INFO("Simplification complete: {} parts, {} -> {} tris ({:.1f}% reduction)",
                 processed, totalBefore, totalAfter,

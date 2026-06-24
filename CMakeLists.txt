@@ -41,7 +41,7 @@ endif()
 
 # OpenCASCADE
 find_path(OpenCASCADE_INCLUDE_DIR Standard_Version.hxx PATHS /opt/homebrew/include/opencascade)
-set(OpenCASCADE_LIBS TKDESTEP TKXSBase TKShHealing
+set(OpenCASCADE_LIBS TKDESTEP TKDEIGES TKXSBase TKShHealing
     TKOffset TKFeat TKFillet TKBool TKMesh TKBO TKPrim TKHLR TKGeomBase TKBRep
     TKGeomAlgo TKTopAlgo TKG3d TKG2d TKMath TKernel TKService TKV3d TKOpenGl
     TKXCAF TKLCAF TKCAF TKCDF TKStd TKBin)
@@ -216,6 +216,13 @@ add_executable(MeshForgeApp src/main.cpp)
 target_link_libraries(MeshForgeApp PRIVATE MeshForgeAppLib)
 
 set_target_properties(MeshForgeApp PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+add_executable(StepProbe tools/StepProbe.cpp)
+target_include_directories(StepProbe PRIVATE src)
+target_link_libraries(StepProbe PRIVATE MeshForgeCore MeshForgeMath MeshForgeGeometry)
+set_target_properties(StepProbe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 

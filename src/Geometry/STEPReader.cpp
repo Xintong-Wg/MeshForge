@@ -4,6 +4,7 @@
 
 #include <opencascade/STEPCAFControl_Reader.hxx>
 #include <opencascade/STEPControl_Reader.hxx>
+#include <opencascade/IGESControl_Reader.hxx>
 #include <opencascade/XCAFDoc_ShapeTool.hxx>
 #include <opencascade/XCAFDoc_DocumentTool.hxx>
 #include <opencascade/TDocStd_Document.hxx>
@@ -22,6 +23,7 @@
 #include <opencascade/XCAFDoc_ColorType.hxx>
 #include <opencascade/TDataStd_Name.hxx>
 #include <opencascade/TCollection_ExtendedString.hxx>
+#include <opencascade/TDF_Tool.hxx>
 #include <opencascade/Message_ProgressRange.hxx>
 #include <opencascade/Message_ProgressIndicator.hxx>
 #include <opencascade/IFSelect_ReturnStatus.hxx>
@@ -38,8 +40,13 @@
 #include <sstream>
 #include <stack>
 #include <filesystem>
+#include <chrono>
+#include <algorithm>
+#include <cctype>
 
 namespace mf {
+
+static constexpr int kBRepCacheSchemaVersion = 5;
 
 // ------------------------------------------------------------------
 // Helper: convert gp_Trsf to Mat4
@@ -48,7 +55,7 @@ static Mat4 toMat4(const gp_Trsf& trsf) {
     Mat4 m(1.0f);
     for (int i = 0; i < 3; ++i) {
         for (int j = 0; j < 4; ++j) {
-            m[i][j] = static_cast<float>(trsf.Value(i + 1, j + 1));
+            m[j][i] = static_cast<float>(trsf.Value(i + 1, j + 1));
         }
     }
     return m;
@@ -71,6 +78,33 @@ static std::string readName(const TDF_Label& label) {
     return "Unnamed";
 }
 
+static std::string labelEntryKey(const TDF_Label& label) {
+    TCollection_AsciiString entry;
+    TDF_Tool::Entry(label, entry);
+
+    std::string key = entry.ToCString();
+    for (char& c : key) {
+        if (c == ':' || c == ' ' || c == '/' || c == '\\') {
+            c = '_';
+        }
+    }
+    return key;
+}
+
+static std::string lowerExtension(const std::string& filepath) {
+    auto pos = filepath.find_last_of('.');
+    if (pos == std::string::npos) return "";
+    std::string ext = filepath.substr(pos + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext;
+}
+
+static bool isIGESFile(const std::string& filepath) {
+    std::string ext = lowerExtension(filepath);
+    return ext == "igs" || ext == "iges";
+}
+
 // ------------------------------------------------------------------
 // Pimpl
 // ------------------------------------------------------------------
@@ -79,6 +113,7 @@ public:
     std::shared_ptr<STEPResult> result;
 
     std::shared_ptr<STEPResult> read(const std::string& filepath, const std::string& cacheDir);
+    std::shared_ptr<STEPResult> readIGESFlat(const std::string& filepath);
     void traverseAssembly(const Handle(XCAFDoc_ShapeTool)& shapeTool,
                           const TDF_Label& label,
                           AssemblyNodePtr parent,
@@ -113,7 +148,13 @@ bool STEPReader::probe(const std::string& filepath, size_t& outEntityCount) {
 
 std::shared_ptr<STEPResult> STEPReader::Impl::read(const std::string& filepath,
                                                     const std::string& cacheDir) {
-    // Try BRep binary cache first (instant load)
+    // IGES files go through a flat reader (different format, no XCAF assembly)
+    if (isIGESFile(filepath)) {
+        MF_INFO("Detected IGES file, using flat reader: {}", filepath);
+        return readIGESFlat(filepath);
+    }
+
+    // Try BRep binary cache first (instant load, STEP only)
     if (!cacheDir.empty() && loadFromCache(cacheDir)) {
         MF_INFO("STEP loaded from BRep cache: {} parts, {} shapes",
                 result->partsById.size(), result->shapesByKey.size());
@@ -124,11 +165,26 @@ std::shared_ptr<STEPResult> STEPReader::Impl::read(const std::string& filepath,
 
     // Use STEPCAFControl_Reader to preserve assembly hierarchy
     STEPCAFControl_Reader reader;
+    reader.SetColorMode(Standard_False);
+    reader.SetLayerMode(Standard_False);
+    reader.SetPropsMode(Standard_False);
+    reader.SetMetaMode(Standard_False);
+    reader.SetProductMetaMode(Standard_False);
+    reader.SetSHUOMode(Standard_False);
+    reader.SetGDTMode(Standard_False);
+    reader.SetMatMode(Standard_False);
+    reader.SetViewMode(Standard_False);
+    reader.SetNameMode(Standard_True);
+
+    auto readStart = std::chrono::steady_clock::now();
     IFSelect_ReturnStatus status = reader.ReadFile(filepath.c_str());
+    auto readEnd = std::chrono::steady_clock::now();
     if (status != IFSelect_RetDone) {
         MF_ERROR("Failed to read STEP file: {}", filepath);
         return nullptr;
     }
+    MF_INFO("STEP ReadFile: {} ms",
+            std::chrono::duration_cast<std::chrono::milliseconds>(readEnd - readStart).count());
 
     result->entityCount = reader.NbRootsForTransfer();
     MF_INFO("STEP entities: {}", result->entityCount);
@@ -144,7 +200,11 @@ std::shared_ptr<STEPResult> STEPReader::Impl::read(const std::string& filepath,
     bool usedFallback = false;
 
     try {
+        auto transferStart = std::chrono::steady_clock::now();
         transferOk = reader.Transfer(doc);
+        auto transferEnd = std::chrono::steady_clock::now();
+        MF_INFO("STEP XCAF Transfer: {} ms",
+                std::chrono::duration_cast<std::chrono::milliseconds>(transferEnd - transferStart).count());
     } catch (const Standard_Failure& e) {
         MF_WARN("STEPCAF Transfer exception: {} — falling back to STEPControl_Reader",
                 e.GetMessageString() ? e.GetMessageString() : "unknown");
@@ -281,6 +341,70 @@ std::shared_ptr<STEPResult> STEPReader::Impl::read(const std::string& filepath,
     return result;
 }
 
+std::shared_ptr<STEPResult> STEPReader::Impl::readIGESFlat(const std::string& filepath) {
+    result = std::make_shared<STEPResult>();
+
+    IGESControl_Reader reader;
+    auto readStart = std::chrono::steady_clock::now();
+    IFSelect_ReturnStatus status = reader.ReadFile(filepath.c_str());
+    auto readEnd = std::chrono::steady_clock::now();
+    if (status != IFSelect_RetDone) {
+        MF_ERROR("Failed to read IGES file: {}", filepath);
+        return nullptr;
+    }
+    MF_INFO("IGES ReadFile: {} ms",
+            std::chrono::duration_cast<std::chrono::milliseconds>(readEnd - readStart).count());
+
+    auto transferStart = std::chrono::steady_clock::now();
+    Standard_Integer transferred = 0;
+    try {
+        transferred = reader.TransferRoots();
+    } catch (const Standard_Failure& e) {
+        MF_ERROR("IGES transfer failed: {}", e.GetMessageString() ? e.GetMessageString() : "unknown");
+        return nullptr;
+    } catch (...) {
+        MF_ERROR("IGES transfer failed with unknown exception");
+        return nullptr;
+    }
+    auto transferEnd = std::chrono::steady_clock::now();
+    MF_INFO("IGES TransferRoots: {} ms",
+            std::chrono::duration_cast<std::chrono::milliseconds>(transferEnd - transferStart).count());
+
+    result->root = std::make_shared<AssemblyNode>();
+    result->root->id = "root";
+    result->root->name = "Root";
+    result->root->type = AssemblyNode::Type::Root;
+    result->entityCount = static_cast<size_t>(std::max<Standard_Integer>(transferred, 0));
+
+    Standard_Integer shapeCount = reader.NbShapes();
+    if (shapeCount <= 0) {
+        MF_ERROR("IGES reader transferred 0 shapes");
+        return nullptr;
+    }
+
+    for (Standard_Integer i = 1; i <= shapeCount; ++i) {
+        TopoDS_Shape shape = reader.Shape(i);
+        if (shape.IsNull()) continue;
+
+        std::string shapeKey = "iges_shape_" + std::to_string(i) + "_" + std::to_string(shape.ShapeType());
+        result->shapesByKey[shapeKey] = shape;
+
+        auto part = std::make_shared<AssemblyNode>();
+        part->id = "iges_part_" + std::to_string(i);
+        part->name = "IGES Part " + std::to_string(i);
+        part->type = AssemblyNode::Type::Part;
+        part->shapeKey = shapeKey;
+        part->localTransform = Mat4(1.0f);
+        part->parent = result->root;
+        result->root->children.push_back(part);
+        result->partsById[part->id] = part;
+    }
+
+    MF_INFO("IGES flat import: {} transferred roots, {} shapes, {} parts",
+            transferred, result->shapesByKey.size(), result->partsById.size());
+    return result;
+}
+
 void STEPReader::Impl::traverseAssembly(const Handle(XCAFDoc_ShapeTool)& shapeTool,
                                         const TDF_Label& label,
                                         AssemblyNodePtr parent,
@@ -326,19 +450,19 @@ void STEPReader::Impl::traverseAssembly(const Handle(XCAFDoc_ShapeTool)& shapeTo
         node->type = AssemblyNode::Type::Part;
 
         // Get the shape from the effective label (the referred label, not the
-        // component reference). The referred shape does NOT have the component's
-        // placement applied, so we use the accumulated 'world' transform in
-        // Application::loadSTEP() to place vertices correctly.
+        // component reference). The component placement is stored on the
+        // assembly node; any top-level location carried by the shape is folded
+        // into that node so tessellation always sees a local shape.
         TopoDS_Shape shp;
-        std::stringstream ss;
         shapeTool->GetShape(effectiveLabel, shp);
-        // Ensure shape is in local coordinates — reset any baked-in location
-        // so that the assembly transform applied in loadSTEP() is the only one.
         if (!shp.IsNull()) {
-            shp.Location(TopLoc_Location());
+            TopLoc_Location shapeLoc = shp.Location();
+            if (!shapeLoc.IsIdentity()) {
+                node->localTransform = node->localTransform * toMat4(shapeLoc.Transformation());
+                shp.Location(TopLoc_Location());
+            }
         }
-        ss << effectiveLabel.Tag() << "_" << shp.ShapeType();
-        node->shapeKey = ss.str();
+        node->shapeKey = "shape_" + labelEntryKey(effectiveLabel) + "_" + std::to_string(shp.ShapeType());
         result->shapesByKey[node->shapeKey] = shp;
         parent->children.push_back(node);
         node->parent = parent;
@@ -358,6 +482,11 @@ bool STEPReader::Impl::loadFromCache(const std::string& cacheDir) {
         if (!jin) return false;
         nlohmann::json j;
         jin >> j;
+
+        if (j.value("schemaVersion", 0) != kBRepCacheSchemaVersion) {
+            MF_INFO("BRep cache schema changed, reparsing STEP");
+            return false;
+        }
 
         result = std::make_shared<STEPResult>();
         result->entityCount = j.value("entityCount", size_t(0));
@@ -453,6 +582,7 @@ void STEPReader::Impl::saveToCache(const std::string& cacheDir) {
 
         // Assembly tree JSON
         nlohmann::json j;
+        j["schemaVersion"] = kBRepCacheSchemaVersion;
         j["entityCount"] = result->entityCount;
         j["fileScale"] = result->fileScale;
 
